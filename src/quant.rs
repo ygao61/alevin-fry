@@ -2377,7 +2377,22 @@ pub fn do_quantify_forseti<T: BufRead, B >(
             "processed {} total read records",
             total_records.to_formatted_string(&Locale::en)
         );
-    
+
+        // Report the per-thread MLP affinity cache effectiveness (forseti scoring).
+        let (mlp_hits, mlp_misses) = crate::forseti::mlp_cache_stats();
+        let mlp_total = mlp_hits + mlp_misses;
+        if mlp_total > 0 {
+            info!(
+                log,
+                "Forseti MLP cache: {} hits + {} misses = {} lookups; hit rate {:.1}% (MLP run on {} unique-ish 30-mers)",
+                mlp_hits.to_formatted_string(&Locale::en),
+                mlp_misses.to_formatted_string(&Locale::en),
+                mlp_total.to_formatted_string(&Locale::en),
+                100.0 * mlp_hits as f64 / mlp_total as f64,
+                mlp_misses.to_formatted_string(&Locale::en)
+            );
+        }
+
         if dump_eq {
             write_eqc_counts(&eqid_map_lock, num_rows, usa_mode, &output_matrix_path, log)?;
         }

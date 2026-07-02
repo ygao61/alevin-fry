@@ -29,6 +29,7 @@ fn reverse_complement(seq: &str) -> Result<String, String> {
     seq.chars().rev().map(complement).collect() // Collect into a Result<String, _>
 }
 
+#[allow(dead_code)]
 fn build_kmers(sequence: &str, ksize: usize) -> Vec<String> {
     // If the sequence is shorter than k, there are no valid k-mers.
     // IMPORTANT: using saturating_sub here is *not* sufficient because it would yield 1
@@ -80,6 +81,7 @@ fn build_kmers(sequence: &str, ksize: usize) -> Vec<String> {
 
 //     one_hot
 // }
+#[allow(dead_code)]
 fn one_hot_encoder(kmer_list: &[String], has_enough_a: &Array1<bool>) -> Array2<f32> {
     let nucleotides = ['A', 'C', 'G', 'T', 'N'];
     let num_classes = nucleotides.len();
@@ -146,53 +148,179 @@ fn load_spline_lookup_table(file_path: &str) -> Result<Array1<f64>> {
         Err(anyhow::anyhow!("Missing 'y' field in JSON"))
     }
 }
+/// Allocation-free 6A detection. For each k-mer window start `i` in `[0, len-k]`,
+/// returns whether `bytes[i..i+k]` contains a run of >= `min_run` consecutive b'A'.
+/// O(len) via a difference array; bit-equivalent to the old per-k-mer
+/// `memmem::find(window, "A"*min_run).is_some()` but with zero String allocations.
+fn compute_has_6a(bytes: &[u8], k: usize, min_run: usize) -> Array1<bool> {
+    if bytes.len() < k {
+        return Array1::from(Vec::<bool>::new());
+    }
+    let n = bytes.len() - k + 1; // number of k-mer windows
+    let mut diff = vec![0i32; n + 1];
+    let mut run = 0usize;
+    for p in 0..bytes.len() {
+        if bytes[p] == b'A' {
+            run += 1;
+        } else {
+            run = 0;
+        }
+        if run >= min_run {
+            // a min_run-A substring ends at p, starts at s = p + 1 - min_run.
+            // window start i contains it iff i <= s and s + min_run <= i + k,
+            // i.e. i in [ (p+1) - k , s ] (clamped to valid window starts).
+            let s = p + 1 - min_run;
+            let lo = (p + 1).saturating_sub(k);
+            let hi = s.min(n - 1);
+            if lo <= hi {
+                diff[lo] += 1;
+                diff[hi + 1] -= 1;
+            }
+        }
+    }
+    let mut hot = vec![false; n];
+    let mut acc = 0i32;
+    for i in 0..n {
+        acc += diff[i];
+        hot[i] = acc > 0;
+    }
+    Array1::from(hot)
+}
+
+/// One-hot encode the k-mers starting at `indices`, reading directly from `bytes`
+/// (no per-k-mer String allocation). Same A,C,G,T,N -> 0..4 column layout as the
+/// previous `one_hot_encoder`.
+fn one_hot_from_bytes(bytes: &[u8], k: usize, indices: &[usize]) -> Array2<f32> {
+    let num_classes = 5usize; // A, C, G, T, N
+    let mut code_to_idx = [-1i32; 256];
+    for (i, &nuc) in [b'A', b'C', b'G', b'T', b'N'].iter().enumerate() {
+        code_to_idx[nuc as usize] = i as i32;
+    }
+    if indices.is_empty() {
+        return Array2::<f32>::zeros((0, 0));
+    }
+    let mut one_hot = Array2::<f32>::zeros((indices.len(), k * num_classes));
+    for (row, &start) in indices.iter().enumerate() {
+        for j in 0..k {
+            let idx = code_to_idx[bytes[start + j] as usize] as usize;
+            one_hot[(row, j * num_classes + idx)] = 1.0;
+        }
+    }
+    one_hot
+}
+
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// Global hit/miss counters for the per-thread MLP affinity cache. One atomic add
+// per process_binding_affinity call (not per 30-mer) -> negligible contention.
+// Read at end of run via `mlp_cache_stats()` to report the hit rate.
+pub static MLP_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+pub static MLP_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+
+/// (hits, misses) for the MLP affinity cache so far.
+pub fn mlp_cache_stats() -> (u64, u64) {
+    (
+        MLP_CACHE_HITS.load(Ordering::Relaxed),
+        MLP_CACHE_MISSES.load(Ordering::Relaxed),
+    )
+}
+
+thread_local! {
+    // packed 30-mer -> FINAL affinity (post discount / all-A / threshold). Per-thread
+    // => no locks, scales with -t. Recurrent multimap loci (Hmgb2 cluster, ribosomal
+    // pseudogenes) appear in every cell, so each worker's cache fills within a few cells.
+    static MLP_AFFINITY_CACHE: RefCell<HashMap<u64, f64>> = RefCell::new(HashMap::new());
+}
+
+/// Pack a k-mer (k <= 32) of A/C/G/T into a u64 (2 bits/base). None if any base is
+/// not A/C/G/T (e.g. N) -> those are computed each time but never cached.
+#[inline]
+fn pack_kmer(bytes: &[u8], start: usize, k: usize) -> Option<u64> {
+    let mut key = 0u64;
+    for j in 0..k {
+        let code = match bytes[start + j] {
+            b'A' => 0u64,
+            b'C' => 1,
+            b'G' => 2,
+            b'T' => 3,
+            _ => return None,
+        };
+        key = (key << 2) | code;
+    }
+    Some(key)
+}
+
 fn process_binding_affinity(
-    all_30mers: &[String],
-    has_enough_a: Array1<bool>,
+    bytes: &[u8],
+    k: usize,
+    has_enough_a: &Array1<bool>,
     mlp: &nn::Sequential,
     discount_perc: f64,
     binding_affinity_threshold: f64,
 ) -> Result<Array1<f64>> {
-    // Collect indices where `has_enough_a` is true
+    // hot window-start indices
     let indices: Vec<usize> = has_enough_a
         .indexed_iter()
         .filter_map(|(i, &val)| if val { Some(i) } else { None })
         .collect();
-    // Filter `all_30mers` using the collected indices
-    let filtered_kmers: Vec<&String> = indices.iter().map(|&i| &all_30mers[i]).collect();
 
-    let encoded = one_hot_encoder(all_30mers, &has_enough_a);
+    let mut out = Array1::<f64>::zeros(has_enough_a.len());
 
-    let mut nonzero_binding_affinity = predict_with_tch(&mlp, encoded)?;
-    // Ensure dimensions match between `nonzero_binding_affinity` and filtered `has_enough_a`
-    if nonzero_binding_affinity.len() != has_enough_a.iter().filter(|&&val| val).count() {
-        return Err(anyhow::anyhow!(
-            "Mismatched dimensions between binding affinity and has_enough_a"
-        ));
-    }
-
-    // Apply discount percentage
-    nonzero_binding_affinity *= discount_perc;
-
-    // Handle "all A" patterns directly using indices
-    let pattern = "A".repeat(30);
-    for (i, kmer) in filtered_kmers.iter().enumerate() {
-        if kmer == &&pattern {
-            nonzero_binding_affinity[i] = 1.0;
-        } else if nonzero_binding_affinity[i] <= binding_affinity_threshold {
-            nonzero_binding_affinity[i] = 0.0;
+    // 1) split hot 30-mers into cache HITS (fill `out` directly) and MISSES (need MLP)
+    let mut miss_start: Vec<usize> = Vec::new();
+    let mut miss_key: Vec<Option<u64>> = Vec::new();
+    let mut hits: u64 = 0;
+    MLP_AFFINITY_CACHE.with(|c| {
+        let cache = c.borrow();
+        for &start in &indices {
+            let key = pack_kmer(bytes, start, k);
+            if let Some(kk) = key {
+                if let Some(&aff) = cache.get(&kk) {
+                    out[start] = aff;
+                    hits += 1;
+                    continue;
+                }
+            }
+            miss_start.push(start);
+            miss_key.push(key);
         }
+    });
+
+    // 2) one batched MLP forward on the MISSES only, then post-process + cache
+    if !miss_start.is_empty() {
+        let encoded = one_hot_from_bytes(bytes, k, &miss_start);
+        let mut nonzero = predict_with_tch(&mlp, encoded)?;
+        if nonzero.len() != miss_start.len() {
+            return Err(anyhow::anyhow!(
+                "Mismatched dimensions between binding affinity and has_enough_a"
+            ));
+        }
+        nonzero *= discount_perc;
+        MLP_AFFINITY_CACHE.with(|c| {
+            let mut cache = c.borrow_mut();
+            for (j, &start) in miss_start.iter().enumerate() {
+                // identical post-processing as before: all-A -> 1.0; <= threshold -> 0.0
+                let aff = if bytes[start..start + k].iter().all(|&b| b == b'A') {
+                    1.0
+                } else if nonzero[j] <= binding_affinity_threshold {
+                    0.0
+                } else {
+                    nonzero[j]
+                };
+                out[start] = aff;
+                if let Some(kk) = miss_key[j] {
+                    cache.insert(kk, aff);
+                }
+            }
+        });
     }
 
-    // Get the length of downstream 30-mers
-    let mut downstream_binding_affinity = Array1::<f64>::zeros(has_enough_a.len());
+    // 3) record hit/miss (one atomic add each per call)
+    MLP_CACHE_HITS.fetch_add(hits, Ordering::Relaxed);
+    MLP_CACHE_MISSES.fetch_add(miss_start.len() as u64, Ordering::Relaxed);
 
-    // Assign the affinity scores to the corresponding indices
-    for (idx, &affinity) in indices.iter().zip(nonzero_binding_affinity.iter()) {
-        downstream_binding_affinity[*idx] = affinity;
-    }
-
-    Ok(downstream_binding_affinity)
+    Ok(out)
 }
 
 pub fn build_status_lookup(
@@ -258,8 +386,7 @@ pub fn forseti_for_multi_best(
     let polya_tail_len = 200;
     let max_frag_len = max_frag_len;
     let binding_affinity_threshold = 0.0;
-    let pattern = "A".repeat(snr_min_size);
-    let pattern_bytes = pattern.as_bytes();
+    // 6A detection is done allocation-free in compute_has_6a (uses snr_min_size).
 
     // Avoid turning stderr into the bottleneck when many MCCs are skipped.
     const INVALID_POS_PRINT_LIMIT: u64 = 2;
@@ -272,6 +399,9 @@ pub fn forseti_for_multi_best(
     let mut sum_log_probs: Vec<f64> = Vec::new();
     let mut tail_sum_log_probs: Vec<f64> = Vec::new();
     const EPS: f64 = 1e-12;
+    // Every "affinity == 0" term is ln(0*frag_prob + EPS) = ln(EPS), a constant.
+    // ~98% of 30-mers have affinity 0, so add this instead of calling the costly .ln().
+    let ln_eps = EPS.ln();
     let mut best_mcc_indices: Vec<u16> = Vec::new();
     let mut max_score = f64::NEG_INFINITY;
 
@@ -291,13 +421,10 @@ pub fn forseti_for_multi_best(
                 continue;
             }
         };
-        let ref_seq = match std::str::from_utf8(ref_seq_bytes) {
-            Ok(s) => s,
-            Err(_) => {
-                eprintln!("Error: ref_id {} sequence bytes were not valid utf-8.", covering_txp_id);
-                continue;
-            }
-        };
+        // SAFETY: the spliceu reference is DNA (A/C/G/T/N) -> always valid ASCII -> valid
+        // UTF-8, so validation can never fail. `from_utf8` would re-scan the whole
+        // transcript (up to ~45 kb) on every candidate (~4% of runtime); skip it.
+        let ref_seq = unsafe { std::str::from_utf8_unchecked(ref_seq_bytes) };
         let tx_ref_end = ref_seq.len();
         let all_forward = algn_tuple_list.iter().all(|algn_tuple| algn_tuple.0);
         let all_reverse = algn_tuple_list.iter().all(|algn_tuple| !algn_tuple.0);
@@ -344,42 +471,43 @@ pub fn forseti_for_multi_best(
             if tx_ref_end - overlap_wdow_start > 30 {
                 let downstream_seq = &ref_seq
                     [(overlap_wdow_start + 1)..usize::min(overlap_wdow_end + 30, tx_ref_end)];
-                let downstream_30mers = build_kmers(downstream_seq, 30);
-                if downstream_30mers.is_empty() {
+                let ds_bytes = downstream_seq.as_bytes();
+                let has_enough_a = compute_has_6a(ds_bytes, 30, snr_min_size);
+                if has_enough_a.is_empty() {
                     continue;
                 }
-                let has_enough_a: Array1<bool> = Array1::from(
-                    downstream_30mers
-                        .iter()
-                        .map(|kmer| memmem::find(kmer.as_bytes(), pattern_bytes).is_some())
-                        .collect::<Vec<bool>>(),
-                );
+                let n_kmers = has_enough_a.len();
                 // if any of the 30mers has enough A, we can process the binding affinity for this mcc
                 if has_enough_a.iter().any(|&x| x) {
                     let downstream_binding_affinity = process_binding_affinity(
-                        &downstream_30mers,
-                        has_enough_a,
+                        ds_bytes,
+                        30,
+                        &has_enough_a,
                         mlp,
                         discount_perc,
                         binding_affinity_threshold,
                     )?;
 
                     sum_log_probs.clear();
-                    sum_log_probs.resize(downstream_30mers.len(), 0.0);
+                    sum_log_probs.resize(n_kmers, 0.0);
 
                     // for each alignment, we compute the prob. distanse = (each algn's start to the overlapped window end), while poly A range is overlap wdow start to end.
                     for &ref_start in &ref_start_list {
                         let prefix_dis = overlap_wdow_start - ref_start;
                         let start_idx = prefix_dis + 1;
-                        let end_idx = prefix_dis + downstream_30mers.len() + 1;
+                        let end_idx = prefix_dis + n_kmers + 1;
                         let downstream_frag_len_prob = spline_lookup.slice(s![start_idx..end_idx]);
                         for (i, (&affinity, &frag_prob)) in downstream_binding_affinity
                             .iter()
                             .zip(downstream_frag_len_prob.iter())
                             .enumerate()
                         {
-                            // avoid log(0), + EPS
-                            sum_log_probs[i] += (affinity * frag_prob + EPS).ln();
+                            // avoid log(0), + EPS; affinity==0 (~98% of 30-mers) -> ln(EPS) constant
+                            sum_log_probs[i] += if affinity == 0.0 {
+                                ln_eps
+                            } else {
+                                (affinity * frag_prob + EPS).ln()
+                            };
                         }
                     }
 
@@ -399,25 +527,21 @@ pub fn forseti_for_multi_best(
                     &ref_seq[tx_ref_end.saturating_sub(30 - 1)..],
                     "A".repeat(needed_extra_a_len.min(15))
                 );
-                let tail_30mers = build_kmers(&tail_seq, 30);
-
-                let has_enough_a: Array1<bool> = Array1::from(
-                    tail_30mers
-                        .iter()
-                        .map(|kmer| memmem::find(kmer.as_bytes(), pattern_bytes).is_some())
-                        .collect::<Vec<bool>>(),
-                );
+                let tail_bytes = tail_seq.as_bytes();
+                let has_enough_a = compute_has_6a(tail_bytes, 30, snr_min_size);
+                let n_tail = has_enough_a.len();
 
                 let tail_binding_affinity = if has_enough_a.iter().any(|&x| x) {
                     process_binding_affinity(
-                        &tail_30mers,
-                        has_enough_a,
+                        tail_bytes,
+                        30,
+                        &has_enough_a,
                         mlp,
                         discount_perc,
                         binding_affinity_threshold,
                     )?
                 } else {
-                    Array1::zeros(tail_30mers.len())
+                    Array1::zeros(n_tail)
                 };
 
                 // Compute joint probabilities for the tail
@@ -450,13 +574,16 @@ pub fn forseti_for_multi_best(
 
                     // Update joint probabilities with tail_binding_affinity
                     for (i, frag_prob) in tail_frag_len_prob.iter().enumerate() {
-                        let affinity = if i < tail_30mers.len() {
+                        let affinity = if i < n_tail {
                              tail_binding_affinity[i]
                         } else {
                              all_a_prob // All A probability; if we got >15 A, also apply all A probability, as this is more likely to be polyA tail mode, not internal polyA mode.
                         };
-                        let prob = affinity * frag_prob + EPS;
-                        tail_sum_log_probs[i] += prob.ln();
+                        tail_sum_log_probs[i] += if affinity == 0.0 {
+                            ln_eps
+                        } else {
+                            (affinity * frag_prob + EPS).ln()
+                        };
                     }
                 }
 
@@ -518,20 +645,15 @@ pub fn forseti_for_multi_best(
                 let rev_comp_seq = reverse_complement(seq_slice).unwrap();
 
                 // Build kmers
-                let upstream_30mers = build_kmers(&rev_comp_seq, 30);
-
-                // Check for has_enough_a
-                let has_enough_a: Array1<bool> = Array1::from(
-                    upstream_30mers
-                        .iter()
-                        .map(|kmer| memmem::find(kmer.as_bytes(), pattern_bytes).is_some())
-                        .collect::<Vec<bool>>(),
-                );
+                let rc_bytes = rev_comp_seq.as_bytes();
+                let has_enough_a = compute_has_6a(rc_bytes, 30, snr_min_size);
+                let n_up = has_enough_a.len();
 
                 if has_enough_a.iter().any(|&x| x) {
                     let upstream_binding_affinity = process_binding_affinity(
-                        &upstream_30mers,
-                        has_enough_a,
+                        rc_bytes,
+                        30,
+                        &has_enough_a,
                         mlp,
                         discount_perc,
                         binding_affinity_threshold,
@@ -540,18 +662,22 @@ pub fn forseti_for_multi_best(
                     let anti_sense_penalty = 0.8;
                     // For each alignment, compute fragment length probabilities
                     sum_log_probs.clear();
-                    sum_log_probs.resize(upstream_30mers.len(), 0.0);
+                    sum_log_probs.resize(n_up, 0.0);
                     for &ref_end in &ref_end_list {
                         let suffix_dis = ref_end - overlap_wdow_end;
                         let start_idx = suffix_dis + 1;
-                        let end_idx = upstream_30mers.len() + suffix_dis + 1;
+                        let end_idx = n_up + suffix_dis + 1;
                         let upstream_frag_len_prob = spline_lookup.slice(s![start_idx..end_idx]);
                         for (i, (&affinity, &frag_prob)) in upstream_binding_affinity
                             .iter()
                             .zip(upstream_frag_len_prob.iter())
                             .enumerate()
                         {
-                            sum_log_probs[i] += (affinity * frag_prob * anti_sense_penalty + EPS).ln();
+                            sum_log_probs[i] += if affinity == 0.0 {
+                                ln_eps
+                            } else {
+                                (affinity * frag_prob * anti_sense_penalty + EPS).ln()
+                            };
                         }
                     }
                     let max_sum = sum_log_probs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);

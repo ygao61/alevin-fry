@@ -1506,45 +1506,62 @@ pub fn do_quantify_forseti<T: BufRead, B >(
             }
         }
 
-        // TODO: if use_forseti, load mlp parameters from the file, otherwise skip
-    
-        // ----------------------load mlp parameters---------------
-        // Load MLP parameters from JSON
-        let mlp_params = load_mlp_params("/fs/nexus-projects/sc_frag_len/nextflow/umi_level/my_clean_custom_alevin_fry/PUG_forseti_project/data/mlp_params_Transpose.json")?;
-        // We'll create mlp for each threads, as VarStore and nn::Sequential is not Sync or Send, we can't safely share them between threads.
-        
-        // -------------------load spline model---------------
-        let spline_lookup_table_file = "/fs/nexus-projects/sc_frag_len/nextflow/umi_level/my_clean_custom_alevin_fry/PUG_forseti_project/data/spline_lookup_table.json";
-        let spline_lookup = load_spline_lookup_table(spline_lookup_table_file)?;
-    
-        // -------prepare spliceu_txome------------
-        let mut spliceu_txome: HashMap<u32, Vec<u8>> = HashMap::new();
-        // read the spliceu fasta file (via needletail)
-        let spliceu_fa = quant_opts.spliceu_fa;
-        // let spliceu_fa = "/fs/nexus-projects/sc_frag_len/nextflow/end2end_forseti_2026/INDEX_generation/af_test_workdir/human-2024-A_spliceu_TxBody_scratch0_2048/ref/roers_ref.fa";
-        let mut fastx = parse_fastx_file(spliceu_fa).context("failed to open spliceu fasta")?;
-        while let Some(record) = fastx.next() {
-            let record = record.context("failed reading spliceu fasta record")?;
-            // header / id is bytes -> utf8 string
-            let mut ref_name = std::str::from_utf8(record.id())
-                .context("spliceu fasta record id was not utf-8")?
-                .to_string();
+        // The MLP, the spline table, the spliceu sequences and the transcript
+        // status lookup are consumed *only* by `get_num_molecules_forseti`.
+        // Every RAD file carrying alignment positions is routed to this
+        // function regardless of the requested resolution, so load these
+        // (the spliceu fasta alone is tens of GB) only when forseti will
+        // actually run.
+        let use_forseti = matches!(resolution, ResolutionStrategy::ForsetiParsimonyEm);
 
-            if let Some(&ref_id) = rname_to_id.get(&ref_name) {
-                // store sequence as raw bytes (A/C/G/T/N...)
-                spliceu_txome.insert(ref_id, record.seq().to_vec());
+        let (mlp_params, spline_lookup, spliceu_txome, tx_status_lookup) = if use_forseti {
+            // ----------------------load mlp parameters---------------
+            // Load MLP parameters from JSON
+            let mlp_params = load_mlp_params("/fs/nexus-projects/sc_frag_len/nextflow/umi_level/my_clean_custom_alevin_fry/PUG_forseti_project/data/mlp_params_Transpose.json")?;
+            // We'll create mlp for each threads, as VarStore and nn::Sequential is not Sync or Send, we can't safely share them between threads.
+
+            // -------------------load spline model---------------
+            let spline_lookup_table_file = "/fs/nexus-projects/sc_frag_len/nextflow/umi_level/my_clean_custom_alevin_fry/PUG_forseti_project/data/spline_lookup_table.json";
+            let spline_lookup = load_spline_lookup_table(spline_lookup_table_file)?;
+
+            // -------prepare spliceu_txome------------
+            let mut spliceu_txome: HashMap<u32, Vec<u8>> = HashMap::new();
+            // read the spliceu fasta file (via needletail)
+            let spliceu_fa = quant_opts.spliceu_fa.context(
+                "the forseti-parsimony-em resolution requires the spliceu transcriptome \
+                 fasta; please provide it with --spliceu-fa",
+            )?;
+            let mut fastx = parse_fastx_file(spliceu_fa).context("failed to open spliceu fasta")?;
+            while let Some(record) = fastx.next() {
+                let record = record.context("failed reading spliceu fasta record")?;
+                // header / id is bytes -> utf8 string
+                let mut ref_name = std::str::from_utf8(record.id())
+                    .context("spliceu fasta record id was not utf-8")?
+                    .to_string();
+
+                if let Some(&ref_id) = rname_to_id.get(&ref_name) {
+                    // store sequence as raw bytes (A/C/G/T/N...)
+                    spliceu_txome.insert(ref_id, record.seq().to_vec());
+                }
             }
-            }
-        info!(log, "Finished. spliceu_txome has {} ref seqs.", spliceu_txome.len());
-        // build the tx status lookup table
-        let tx_status_lookup: Vec<u8> = build_status_lookup(&quant_opts.tg_map, &hdr.ref_names)?;
+            info!(log, "Finished. spliceu_txome has {} ref seqs.", spliceu_txome.len());
+            // build the tx status lookup table; this also enforces that the
+            // t2g map is the 3-column (splicing status) flavor, which forseti
+            // requires in order to tell spliced from unspliced candidates.
+            let tx_status_lookup: Vec<u8> = build_status_lookup(&quant_opts.tg_map, &hdr.ref_names)?;
+
+            (
+                Some(Arc::new(mlp_params)),
+                Some(Arc::new(spline_lookup)),
+                Some(Arc::new(spliceu_txome)),
+                Some(Arc::new(tx_status_lookup)),
+            )
+        } else {
+            (None, None, None, None)
+        };
 
         // Share read-only resources across worker threads
         let ref_names = Arc::new(hdr.ref_names.clone());
-        let spliceu_txome = Arc::new(spliceu_txome);
-        let spline_lookup = Arc::new(spline_lookup);
-        let mlp_params = Arc::new(mlp_params);
-        let tx_status_lookup = Arc::new(tx_status_lookup);
 
         let mut _num_reads: usize = 0;
     
@@ -1736,10 +1753,11 @@ pub fn do_quantify_forseti<T: BufRead, B >(
             };    
             // now, make the worker thread
             let handle = std::thread::spawn(move || {
-                // Create Forseti MLP once per worker thread (nn::Sequential is not Sync/Send)
-                // TODO: only load mlp for Forseti
-                let mlp = create_mlp_with_tch(mlp_params.as_ref())
-                    .expect("failed to create MLP model for Forseti");
+                // Create Forseti MLP once per worker thread (nn::Sequential is not Sync/Send);
+                // only the forseti resolution has any use for it.
+                let mlp = mlp_params.as_ref().map(|p| {
+                    create_mlp_with_tch(p.as_ref()).expect("failed to create MLP model for Forseti")
+                });
                 // these can be created once and cleared after processing
                 // each cell.
                 let mut unique_evidence = vec![false; num_rows];
@@ -1992,10 +2010,19 @@ pub fn do_quantify_forseti<T: BufRead, B >(
                                             read_length,
                                             max_frag_len as u16,
                                             ref_names.as_ref(),
-                                            spliceu_txome.as_ref(),
-                                            spline_lookup.as_ref(),
-                                            &mlp,
-                                            tx_status_lookup.as_ref(),
+                                            spliceu_txome
+                                                .as_ref()
+                                                .expect("forseti resources must be loaded")
+                                                .as_ref(),
+                                            spline_lookup
+                                                .as_ref()
+                                                .expect("forseti resources must be loaded")
+                                                .as_ref(),
+                                            mlp.as_ref().expect("forseti MLP must be built"),
+                                            tx_status_lookup
+                                                .as_ref()
+                                                .expect("forseti resources must be loaded")
+                                                .as_ref(),
                                             &log,
                                         );
                                         // clear eqmap state for next cell (matches other resolution branches)
@@ -2068,7 +2095,8 @@ pub fn do_quantify_forseti<T: BufRead, B >(
                                         }
                                         ResolutionStrategy::CellRangerLikeEm
                                         | ResolutionStrategy::ParsimonyEm
-                                        | ResolutionStrategy::ParsimonyGeneEm => {
+                                        | ResolutionStrategy::ParsimonyGeneEm
+                                        | ResolutionStrategy::ForsetiParsimonyEm => {
                                             counts =
                                                 afutils::extract_counts_mm_uniform(&gene_eqc, num_rows);
                                         }
@@ -2086,7 +2114,8 @@ pub fn do_quantify_forseti<T: BufRead, B >(
                                         } else {
                                             match resolution {
                                                 ResolutionStrategy::CellRangerLikeEm
-                                                | ResolutionStrategy::ParsimonyEm => {
+                                                | ResolutionStrategy::ParsimonyEm
+                                                | ResolutionStrategy::ForsetiParsimonyEm => {
                                                     let contrib = 1.0 / (k.len() as f32);
                                                     for g in k.iter() {
                                                         counts[*g as usize] += contrib;

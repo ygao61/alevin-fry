@@ -38,11 +38,26 @@ pub struct EqMapEntry {
     pub eq_num: u32,
 }
 
-/// Forseti-specific entry: for each eq-class, keep a list
-/// of UMIs, and for each UMI keep the list of read identifiers (here: `read_idx`) rather thanthe umi count
+/// Forseti-specific entry: for each eq-class, keep the (umi, read_idx) pairs so
+/// that the per-UMI read lists can be recovered in the SAME order as the
+/// sorted-and-collapsed `EqMapEntry::umis`.
+///
+/// During `init_from_chunk_forseti` the pairs are pushed in read order; the
+/// finalization pass sorts them by (umi, read_idx) and fills `read_start` with
+/// the group boundaries. Because `EqMapEntry::umis` is sorted by UMI value in
+/// the same pass, group k here corresponds to `eqc_info[eq].umis[k]`, so the
+/// PUG vertex `(eq_id, umi_idx)` indexes both structures consistently.
+/// (Previously the per-UMI lists were kept in first-encounter order, so
+/// `umi_idx` — which refers to the sorted order — fetched the reads of a
+/// *different* molecule whenever an eq-class had >= 2 distinct UMIs.)
 #[derive(Debug)]
 pub struct EqMapEntryForseti {
-    pub umis: Vec<(u64, Vec<u64>)>,
+    /// (umi, read_idx) pairs; sorted by (umi, read_idx) after finalization.
+    pub umi_read_pairs: Vec<(u64, u64)>,
+    /// Group offsets into `umi_read_pairs`: the reads for `umi_idx` k are
+    /// `umi_read_pairs[read_start[k] .. read_start[k + 1]]`.
+    /// Length = (#distinct UMIs) + 1.
+    pub read_start: Vec<u32>,
     pub eq_num: u32,
 }
 // NOTE: this is _clearly_ redundant with the EqMap below.
@@ -620,15 +635,13 @@ impl EqMap {
                     // Hope this is cheap enough.
                     self.eqc_info[eqi].umis.push((r.umi(), 1));
 
-                    // Forseti trace: keep read_idx list per UMI
-                    let fe = &mut self.eqc_info_forseti[eqi];
-                    if let Some((_u, reads)) = fe.umis.iter_mut().find(|(u, _)| *u == r.umi()) {
-                        // If the UMI exists, append the read name to the list of read_idx
-                        reads.push(read_idx);
-                    } else {
-                        // If the UMI doesn't exist, add a new entry with the UMI and read_idx
-                        fe.umis.push((r.umi(), vec![read_idx]));
-                    }
+                    // Forseti trace: record the (umi, read_idx) pair; grouping by UMI
+                    // happens in the finalization pass (sort by (umi, read_idx)),
+                    // which keeps this O(1) per read instead of a linear scan over
+                    // the distinct UMIs of the eq-class.
+                    self.eqc_info_forseti[eqi]
+                        .umi_read_pairs
+                        .push((r.umi(), read_idx));
                 }
                 // otherwise, add the new umi, but we also have some extra bookkeeping
                 None => {
@@ -649,7 +662,8 @@ impl EqMap {
                         eq_num,
                     });
                     self.eqc_info_forseti.push(EqMapEntryForseti {
-                        umis: vec![(r.umi(), vec![read_idx])],
+                        umi_read_pairs: vec![(r.umi(), read_idx)],
+                        read_start: Vec::new(),
                         eq_num,
                     });
                     self.eqid_map.insert(key_vec, eq_num);
@@ -689,6 +703,29 @@ impl EqMap {
                 }
             }
             v.umis.push((cur_elem, count));
+
+            // Forseti: sort the (umi, read_idx) pairs so that the per-UMI groups
+            // appear in the SAME (ascending-UMI) order as the just-collapsed
+            // `v.umis`, then record the group boundaries. This is what makes the
+            // PUG vertex `umi_idx` valid for both structures.
+            let fe = &mut self.eqc_info_forseti[idx];
+            fe.umi_read_pairs.sort_unstable();
+            fe.read_start.clear();
+            fe.read_start.reserve(v.umis.len() + 1);
+            fe.read_start.push(0);
+            for i in 1..fe.umi_read_pairs.len() {
+                if fe.umi_read_pairs[i].0 != fe.umi_read_pairs[i - 1].0 {
+                    fe.read_start.push(i as u32);
+                }
+            }
+            fe.read_start.push(fe.umi_read_pairs.len() as u32);
+            // Alignment guarantee: one group per distinct UMI, same order as v.umis.
+            debug_assert_eq!(fe.read_start.len() - 1, v.umis.len());
+            debug_assert!(v
+                .umis
+                .iter()
+                .enumerate()
+                .all(|(k, &(u, _))| fe.umi_read_pairs[fe.read_start[k] as usize].0 == u));
         }
     }
 

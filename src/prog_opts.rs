@@ -37,7 +37,8 @@ pub struct QuantOpts<'a, 'b, 'c, 'd, 'e, 'f, 'g, 'h> {
     pub large_graph_thresh: usize,
     pub max_frag_len: u16,
     pub filter_list: Option<&'d PathBuf>,
-    pub spliceu_fa: &'h PathBuf,
+    /// only required (and only used) by the forseti resolution strategy
+    pub spliceu_fa: Option<&'h PathBuf>,
     pub cmdline: &'e str,
     pub version: &'f str,
     #[serde(skip_serializing)]

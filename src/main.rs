@@ -154,7 +154,7 @@ fn main() -> anyhow::Result<()> {
     .arg(arg!(-m --"tg-map" <TGMAP>  "transcript to gene map").required(true).value_parser(pathbuf_file_exists_validator))
     .arg(arg!(-o --"output-dir" <OUTPUTDIR> "output directory where quantification results will be written").required(true).value_parser(value_parser!(PathBuf)))
     .arg(arg!(-t --threads <THREADS> "number of threads to use for processing").value_parser(value_parser!(u32)).default_value(max_num_threads.clone()))
-    .arg(arg!(-s --"spliceu-fa" <SPLICEUFA> "spliceu transcriptome fasta file").required(true).value_parser(value_parser!(PathBuf)))
+    .arg(arg!(-s --"spliceu-fa" <SPLICEUFA> "spliceu transcriptome fasta file (required only for the forseti-parsimony-em resolution)").value_parser(pathbuf_file_exists_validator))
     .arg(arg!(-d --"dump-eqclasses" "flag for dumping equivalence classes"))
     .arg(arg!(-b --"num-bootstraps" <NUMBOOTSTRAPS> "number of bootstraps to use").value_parser(value_parser!(u32)).default_value("0"))
     .arg(arg!(--"init-uniform" "flag for uniform sampling").requires("num-bootstraps"))
@@ -431,7 +431,7 @@ fn main() -> anyhow::Result<()> {
         let large_graph_thresh: usize = *t.get_one("large-graph-thresh").unwrap();
         let umi_edit_dist: u32 = *t.get_one("umi-edit-dist").unwrap();
         // splieu_fa_path
-        let spliceu_fa: &PathBuf = t.get_one("spliceu-fa").unwrap();
+        let spliceu_fa: Option<&PathBuf> = t.get_one("spliceu-fa");
         let mut pug_exact_umi = false;
 
         match umi_edit_dist {
@@ -510,6 +510,17 @@ fn main() -> anyhow::Result<()> {
                     std::process::exit(1);
                 }
             }
+        }
+
+        // the forseti resolution scores candidates against the transcript
+        // sequences, so it needs the spliceu fasta; every other strategy
+        // never touches it.
+        if resolution == ResolutionStrategy::ForsetiParsimonyEm && spliceu_fa.is_none() {
+            crit!(
+                log,
+                "\n\nThe forseti-parsimony-em resolution strategy requires the spliceu transcriptome fasta; please provide it with --spliceu-fa"
+            );
+            bail!("Invalid command line option");
         }
 
         // first make sure that the input direcory passed in has the

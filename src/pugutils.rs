@@ -1862,10 +1862,13 @@ fn get_check_mcc_list(
             let mut check_read_idx_list: Vec<u64> = Vec::new();
             for v in mcc.iter() {
                 let (eq_id, umi_idx) = g.from_index(*v as usize);
-                let eq = &eqmap.eqc_info_forseti[eq_id as usize];
-                let (_umi_bit, read_idx_list) = &eq.umis[umi_idx as usize];
-                check_read_idx_list.reserve(read_idx_list.len());
-                check_read_idx_list.extend(read_idx_list.iter().copied());
+                let fe = &eqmap.eqc_info_forseti[eq_id as usize];
+                // `umi_idx` refers to the sorted UMI order; `read_start` groups
+                // `umi_read_pairs` in that same order (see EqMapEntryForseti).
+                let s = fe.read_start[umi_idx as usize] as usize;
+                let e = fe.read_start[umi_idx as usize + 1] as usize;
+                check_read_idx_list.reserve(e - s);
+                check_read_idx_list.extend(fe.umi_read_pairs[s..e].iter().map(|&(_, ridx)| ridx));
             }
             check_mcc_list.push((mcc.clone(), *covering_txp_id, check_read_idx_list));
         }
@@ -1889,9 +1892,12 @@ fn get_check_mcc_list_from_map(
         // (Since all txps in the list cover the same MCC, the reads are the same)
         for v in mcc.iter() {
             let (eq_id, umi_idx) = g.from_index(*v as usize);
-            let eq = &eqmap.eqc_info_forseti[eq_id as usize];
-            let (_umi_bit, read_idx_list) = &eq.umis[umi_idx as usize];
-            check_read_idx_list.extend(read_idx_list.iter().copied());
+            let fe = &eqmap.eqc_info_forseti[eq_id as usize];
+            // `umi_idx` refers to the sorted UMI order; `read_start` groups
+            // `umi_read_pairs` in that same order (see EqMapEntryForseti).
+            let s = fe.read_start[umi_idx as usize] as usize;
+            let e = fe.read_start[umi_idx as usize + 1] as usize;
+            check_read_idx_list.extend(fe.umi_read_pairs[s..e].iter().map(|&(_, ridx)| ridx));
         }
 
         // 2. Sort and Dedup the read list to keep it clean and efficient for downstream

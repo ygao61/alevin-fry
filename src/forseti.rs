@@ -402,8 +402,8 @@ pub fn forseti_for_multi_best(
     // Every "affinity == 0" term is ln(0*frag_prob + EPS) = ln(EPS), a constant.
     // ~98% of 30-mers have affinity 0, so add this instead of calling the costly .ln().
     let ln_eps = EPS.ln();
-    let mut best_mcc_indices: Vec<u16> = Vec::new();
-    let mut max_score = f64::NEG_INFINITY;
+    // Per-candidate scores; the winner set is chosen in a second pass below.
+    let mut scored: Vec<(u16, f64)> = Vec::new();
 
 
     // algn_tuple_list is direction(fw, reverse) and ref_start
@@ -691,20 +691,31 @@ pub fn forseti_for_multi_best(
             continue;
         }
 
-        // Update the best scores and indices in a single pass
-        if norm_sum_joint_prob > max_score {
-            max_score = norm_sum_joint_prob;
-            best_mcc_indices.clear();
-            best_mcc_indices.push(*mcc_idx as u16);
-        } else if (norm_sum_joint_prob - max_score).abs() < 1e-6 && norm_sum_joint_prob != f64::NEG_INFINITY {
-            best_mcc_indices.push(*mcc_idx as u16);
-        }
+        // Just record the score here; the winner set is picked below.
+        scored.push((*mcc_idx as u16, norm_sum_joint_prob));
     }
 
-    if best_mcc_indices.is_empty() {
+    // Take the true maximum first, then collect every candidate within TIE_EPS
+    // of it. The previous single running-max pass was order dependent: "within
+    // TIE_EPS" is not transitive, so a candidate that ties against one anchor is
+    // discarded against another, and the anchor depended on which candidate the
+    // iteration happened to visit first. Two passes make the winner set a
+    // function of the scores alone.
+    const TIE_EPS: f64 = 1e-6;
+    let max_score = scored
+        .iter()
+        .map(|&(_, score)| score)
+        .fold(f64::NEG_INFINITY, f64::max);
+    if max_score == f64::NEG_INFINITY {
+        // No candidate could be scored at all; forseti abstains and the caller
+        // keeps the labels it held before calling us.
         return Ok(Vec::new());
     }
-
+    let best_mcc_indices: Vec<u16> = scored
+        .iter()
+        .filter(|&&(_, score)| score != f64::NEG_INFINITY && (max_score - score) <= TIE_EPS)
+        .map(|&(mcc_idx, _)| mcc_idx)
+        .collect();
 
     Ok(best_mcc_indices)
 }

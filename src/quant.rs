@@ -51,7 +51,7 @@ use crate::prog_opts::QuantOpts;
 use crate::pugutils;
 use crate::utils::KnownRecordType;
 use crate::utils as afutils;
-use crate::mlp_spline::{create_mlp_with_tch, load_mlp_params, load_spline_lookup_table};
+use crate::mlp_spline::{create_mlp_with_tch, load_mlp_params_from_str, load_spline_lookup_table_from_str};
 use crate::forseti::build_status_lookup;
 
 type BufferedGzFile = BufWriter<GzEncoder<fs::File>>;
@@ -1334,6 +1334,11 @@ where
 }
 
 
+/// Trained forseti MLP parameters, embedded at compile time from `resources/`.
+const MLP_PARAMS_JSON: &str = include_str!("../resources/mlp_params_Transpose.json");
+/// Fragment-length spline lookup table, embedded at compile time from `resources/`.
+const SPLINE_TABLE_JSON: &str = include_str!("../resources/spline_lookup_table.json");
+
 pub fn do_quantify_forseti<T: BufRead, B >(
     mut br: T, quant_opts: QuantOpts, prelude: RadPrelude, file_tag_map: TagMap
     ) -> anyhow::Result<()> 
@@ -1516,13 +1521,14 @@ pub fn do_quantify_forseti<T: BufRead, B >(
 
         let (mlp_params, spline_lookup, spliceu_txome, tx_status_lookup) = if use_forseti {
             // ----------------------load mlp parameters---------------
-            // Load MLP parameters from JSON
-            let mlp_params = load_mlp_params("/fs/nexus-projects/sc_frag_len/nextflow/umi_level/my_clean_custom_alevin_fry/PUG_forseti_project/data/mlp_params_Transpose.json")?;
+            // The trained model and the fragment-length spline are shipped in
+            // `resources/` and embedded at compile time, so a build carries
+            // them with it and needs no external data files at run time.
+            let mlp_params = load_mlp_params_from_str(MLP_PARAMS_JSON)?;
             // We'll create mlp for each threads, as VarStore and nn::Sequential is not Sync or Send, we can't safely share them between threads.
 
             // -------------------load spline model---------------
-            let spline_lookup_table_file = "/fs/nexus-projects/sc_frag_len/nextflow/umi_level/my_clean_custom_alevin_fry/PUG_forseti_project/data/spline_lookup_table.json";
-            let spline_lookup = load_spline_lookup_table(spline_lookup_table_file)?;
+            let spline_lookup = load_spline_lookup_table_from_str(SPLINE_TABLE_JSON)?;
 
             // -------prepare spliceu_txome------------
             let mut spliceu_txome: HashMap<u32, Vec<u8>> = HashMap::new();

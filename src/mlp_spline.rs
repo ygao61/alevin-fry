@@ -5,8 +5,6 @@ use serde::{Deserialize, Serialize};
 use tch::nn::ModuleT;
 use tch::no_grad;
 use tch::{nn, Device,Kind, Tensor};
-use std::fs::File;
-use std::io::BufReader;
 use serde_json::Value;
 
 #[derive(Deserialize, Serialize)]
@@ -56,6 +54,15 @@ pub fn load_mlp_params(file_path: &str) -> Result<MLPParamsND> {
     let file = std::fs::File::open(file_path)
         .with_context(|| format!("Failed to open file at path: {}", file_path))?;
     let params: MLPParams = serde_json::from_reader(file)
+        .with_context(|| "Failed to parse MLP parameters from JSON")?;
+    params.to_ndarray()
+}
+
+/// Same as [`load_mlp_params`], but reads the JSON from memory. Used with the
+/// model shipped in `resources/` via `include_str!`, so a build needs no
+/// external data files at run time.
+pub fn load_mlp_params_from_str(json: &str) -> Result<MLPParamsND> {
+    let params: MLPParams = serde_json::from_str(json)
         .with_context(|| "Failed to parse MLP parameters from JSON")?;
     params.to_ndarray()
 }
@@ -155,20 +162,28 @@ pub fn predict_with_tch(net: &nn::Sequential, input: Array2<f32>) -> Result<Arra
 // }
 
 
-pub fn load_spline_lookup_table(file_path: &str) -> anyhow::Result<Array1<f64>> {
-    // Open the file
-    let file = File::open(file_path)?;
-    let reader = BufReader::new(file);
+/// Same as [`load_spline_lookup_table`], but reads the JSON from memory
+/// (see [`load_mlp_params_from_str`]).
+pub fn load_spline_lookup_table_from_str(json: &str) -> anyhow::Result<Array1<f64>> {
+    let json_data: Value = serde_json::from_str(json)?;
+    parse_spline_y(&json_data)
+}
 
-    // Parse the JSON
-    let json_data: Value = serde_json::from_reader(reader)?;
-
+fn parse_spline_y(json_data: &Value) -> anyhow::Result<Array1<f64>> {
     // Extract the "y" field as an array
     if let Some(y_values) = json_data["y"].as_array() {
-        // Convert JSON array to Vec<f64>
+        // Convert JSON array to Vec<f64>.
+        //
+        // The table is a fragment-length density (it sums to 1 and peaks around
+        // index 216), but the spline fit undershoots below zero in the short-
+        // fragment tail where the true density is ~0: 29 of the 1011 entries are
+        // negative (indices 0-6 and 37-58, smallest -1.6e-5). Those are fitting
+        // artefacts, and feeding one to `(affinity * frag_prob + EPS).ln()`
+        // yields NaN, which then poisons that position's running sum. Clamp them
+        // back to 0 here, once, so every consumer sees a valid density.
         let y_vec: Vec<f64> = y_values
             .iter()
-            .map(|v| v.as_f64().unwrap_or(0.0)) // Ensure conversion
+            .map(|v| v.as_f64().unwrap_or(0.0).max(0.0)) // Ensure conversion; no negative density
             .collect();
 
         // Convert Vec<f64> to ndarray::Array1

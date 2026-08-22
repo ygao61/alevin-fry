@@ -13,3 +13,6 @@ tmp.rs
 flamegraph.svg
 perf.data
 perf.data.*
+
+# isolated build dirs used for side-by-side binaries
+/target_*/

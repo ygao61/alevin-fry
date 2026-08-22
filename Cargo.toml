@@ -18,6 +18,7 @@ documentation = "https://alevin-fry.readthedocs.io/en/latest/"
 include = [
   "/src/*.rs",
   "/src/atac/*.rs",
+  "/resources/*.json",
   "/Cargo.toml",
   "/README.md",
   "/LICENSE",

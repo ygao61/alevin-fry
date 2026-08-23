@@ -37,7 +37,7 @@ type CcMap = HashMap<u32, Vec<u32>, ahash::RandomState>;
 // Forseti/RAD alignment tuple: (dir, ref_start)
 type AlgnTuple = (bool, u32);
 
-use crate::forseti::forseti_for_multi_best;
+use crate::forseti::{forseti_for_multi_best, ForsetiCheckingList};
 use ndarray::Array1;
 use rand::rngs::StdRng;
 use rand::Rng;
@@ -1624,6 +1624,8 @@ pub fn get_num_molecules_forseti(
                 global_genes.dedup();
 
                 let mut filtered_mcc_txp_pairs: HashMap<Vec<u32>, Vec<u32>, ahash::RandomState> = HashMap::with_capacity_and_hasher(full_mcc_txp_map.keys().len(), hasher_state.clone());
+                // MCC of forseti's lowest-index winner; used as the deterministic tie-break.
+                let mut first_best_mcc: Option<Vec<u32>> = None;
 
                 // update best_mcc and global_txps if we have useful information from forseti.
                 if need_forseti {
@@ -1655,6 +1657,12 @@ pub fn get_num_molecules_forseti(
                                 let mcc_info_tuple = &check_mcc_list[*mcc_idx as usize];
                                 let predict_best_cvr_txp = mcc_info_tuple.1;
                                 let predict_best_mcc = mcc_info_tuple.0.clone();
+                                // best_mcc_indices is in mcc_idx order, so the first
+                                // entry is the lowest-index winner; remember its MCC as
+                                // the deterministic tie-break below.
+                                if first_best_mcc.is_none() {
+                                    first_best_mcc = Some(predict_best_mcc.clone());
+                                }
                                 filtered_mcc_txp_pairs.entry(predict_best_mcc)
                                     .or_insert(Vec::new())
                                     .push(predict_best_cvr_txp);
@@ -1670,14 +1678,17 @@ pub fn get_num_molecules_forseti(
                     }
                     // after forseti
                     global_txps.clear(); //reset global_txps
-                    if !filtered_mcc_txp_pairs.is_empty() {
-                        // we have narrowed down mcc/txps from forseti. update best_mc and global_txps,  
-
-                        //Even though forseti output all equally best mcc and txp. we will eventually choose just one "best_mcc" to proceed. here we use the first mcc.
-                        let (bm, txps) = filtered_mcc_txp_pairs.iter().next().unwrap();
-                        best_mcc = bm.clone();
+                    if let Some(bm) = first_best_mcc.take() {
+                        // we have narrowed down mcc/txps from forseti. update best_mcc and global_txps.
+                        // Forseti may return several equally-best (mcc, txp) pairs spanning more
+                        // than one MCC; we proceed with exactly one MCC. The tie-break is the MCC
+                        // of the lowest-index winner (check_mcc_list order), which is a fixed
+                        // function of the cell's reads -- previously this took the first entry
+                        // of a hash map, i.e. an arbitrary, run-dependent member of the tie.
+                        let txps = &filtered_mcc_txp_pairs[&bm];
                         global_txps.extend(txps.iter().copied());
-                        //instead of uisng its original global_txp, we use its winner txps(narrowed down txps) from forseti.
+                        best_mcc = bm;
+                        //instead of using its original global_txp, we use its winner txps(narrowed down txps) from forseti.
                     }else{
                         best_mcc = full_mcc_txp_map.keys().next().unwrap().clone();
                         global_txps = full_mcc_txp_map.values().next().unwrap().clone();
@@ -1921,7 +1932,7 @@ fn get_check_mcc_list_from_map(
 fn get_forseti_check_list(
     cell_reads: &[AlevinFryReadRecordWithPosition],
     check_mcc_list: &[(Vec<u32>, u32, Vec<u64>)],
-) -> HashMap<(usize, u32), Vec<AlgnTuple>> {
+) -> ForsetiCheckingList {
     // Forseti only needs alignment tuples for a small subset of (read_idx, covering_txp_id)
     // pairs. Avoid building a large HashMap over all alignments for the cell; instead, look up
         // the tuple on-demand by scanning the corresponding read's alignments (na is typically small).
@@ -1944,21 +1955,21 @@ fn get_forseti_check_list(
         None
     }
 
-    // Pre-allocate roughly one entry per mcc
-    let mut forseti_checking_list: HashMap<(usize, u32), Vec<AlgnTuple>> =
-        HashMap::with_capacity(check_mcc_list.len());
+    // Exactly one entry per (mcc, covering txp) pair, in check_mcc_list order, so
+    // forseti's returned mcc indices index straight back into check_mcc_list.
+    // An entry whose reads have no alignment on the covering txp is kept (empty)
+    // so the indices stay aligned; forseti skips it.
+    let mut forseti_checking_list: ForsetiCheckingList = Vec::with_capacity(check_mcc_list.len());
 
-    for (mcc_idx, (mcc, covering_txp_id, read_idx_list)) in check_mcc_list.iter().enumerate() {
-        let key = (mcc_idx, *covering_txp_id);
-        let vec_ref = forseti_checking_list
-            .entry(key)
-            .or_insert_with(|| Vec::with_capacity(read_idx_list.len()));
+    for (_mcc, covering_txp_id, read_idx_list) in check_mcc_list.iter() {
+        let mut algn_tuples: Vec<AlgnTuple> = Vec::with_capacity(read_idx_list.len());
         for &read_idx in read_idx_list {
             if let Some(algn_tuple) = find_algn_tuple_for_read(cell_reads, read_idx, *covering_txp_id)
             {
-                vec_ref.push(algn_tuple);
-    }
+                algn_tuples.push(algn_tuple);
+            }
         }
+        forseti_checking_list.push((*covering_txp_id, algn_tuples));
     }
     forseti_checking_list
 }

@@ -8,11 +8,13 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use tch::nn;
-type MCCIndex = usize;
 type CoveringTxpId = u32;
 /// RAD alignment tuple: (is_reverse, ref_start)
 type AlgnTuple = (bool, u32);
-type ForsetiCheckingList = HashMap<(MCCIndex, CoveringTxpId), Vec<AlgnTuple>>;
+/// One entry per `check_mcc_list` element, in the same order, so the position in
+/// this Vec *is* the MCC index reported back to the caller. A Vec (rather than a
+/// HashMap keyed by that index) keeps candidate iteration order fixed across runs.
+pub type ForsetiCheckingList = Vec<(CoveringTxpId, Vec<AlgnTuple>)>;
 use memchr::memmem;
 
 
@@ -406,8 +408,10 @@ pub fn forseti_for_multi_best(
     let mut scored: Vec<(u16, f64)> = Vec::new();
 
 
+    // Candidates are visited in check_mcc_list order (mcc_idx ascending), so the
+    // order of the returned winner list is deterministic.
     // algn_tuple_list is direction(fw, reverse) and ref_start
-    for ((mcc_idx, covering_txp_id), algn_tuple_list) in forseti_checking_list {
+    for (mcc_idx, (covering_txp_id, algn_tuple_list)) in forseti_checking_list.iter().enumerate() {
         let mut norm_sum_joint_prob = f64::NEG_INFINITY;
 
         let ref_seq_bytes = match spliceu_txome.get(covering_txp_id) {
@@ -692,7 +696,7 @@ pub fn forseti_for_multi_best(
         }
 
         // Just record the score here; the winner set is picked below.
-        scored.push((*mcc_idx as u16, norm_sum_joint_prob));
+        scored.push((mcc_idx as u16, norm_sum_joint_prob));
     }
 
     // Take the true maximum first, then collect every candidate within TIE_EPS
@@ -700,7 +704,7 @@ pub fn forseti_for_multi_best(
     // TIE_EPS" is not transitive, so a candidate that ties against one anchor is
     // discarded against another, and the anchor depended on which candidate the
     // iteration happened to visit first. Two passes make the winner set a
-    // function of the scores alone.
+    // function of the scores alone, and its order is mcc_idx ascending.
     const TIE_EPS: f64 = 1e-6;
     let max_score = scored
         .iter()

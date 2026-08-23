@@ -43,7 +43,7 @@ cell. Those cells are written as all-zero rows, land in `empty_resolved_cells`, 
 `MeanByMax`. Fix: add `ForsetiParsimonyEm` to the `CellRangerLikeEm | ParsimonyEm | ParsimonyGeneEm`
 arm (uniform split) and make the fallback `vec![0; num_rows]`.
 
-### 1.3 HIGH — latent panic in collate thread-local bucket buffer (forseti-exposed)
+### 1.3 HIGH — latent panic in collate thread-local bucket buffer (forseti-exposed) — **fixed (fix16)**
 `collate.rs:492-498`: `loc_buffer_size` lower bound assumes 4 B/alignment (`24 + most_ambig*4`), but the
 position record is `20 + 8*na` bytes (libradicl `record.rs:324-340`). With many threads/buckets the
 clamp term shrinks (e.g. 64 threads, `-m 30 M` → ≈ 10.9 KB) and a read with > ~1,360 retained
@@ -60,11 +60,22 @@ with `usa_offsets=None` → garbage indices. Fix: optional arg; `bail!` if
   is NaN there; NaN positions are silently dropped by the `f64::max` fold. Clamp `y.max(0.0)` at load.
 - `forseti_checking_list` is a `std::HashMap` (random `RandomState`) iterated to pick winners
   (`forseti.rs:410`); tie order is therefore per-process random. It is keyed by `(mcc_idx, txp)` which
-  is just the index into `check_mcc_list` → make it a `Vec<Vec<AlgnTuple>>`.
+  is just the index into `check_mcc_list` → make it a `Vec<(u32 txp, Vec<AlgnTuple>)>`.
+  *Update 2026-08-23 (two independent code reviews):* the winner **set** is order-independent since
+  `3b0ad4a`, and the per-candidate hash is < 1 % of candidate cost (the MLP cache lookups dominate), so
+  this is hygiene, not speed. Order still leaks through (i) `filtered_mcc_txp_pairs.iter().next()`
+  (`pugutils.rs:1675`) on cross-MCC ties and (ii) which 30-mers are batched into one libtorch call —
+  so a Vec gives a *different* deterministic order, not the current one; verify run-to-run identity
+  empirically. Cheapest determinism: `ahash::RandomState::with_seeds(2,7,1,8)` like the rest of the
+  crate. `INVALID_POS_PRINT_LIMIT`/`invalid_pos_skipped` (`forseti.rs:392-393`) are dead code.
+  **Done (fix17):** `Vec<(txp, Vec<AlgnTuple>)>` + explicit tie-break (MCC of the lowest-index winner).
+  pbmc_1k_v3 on one collated RAD: fix16 vs fix16 moved 4 UMIs between genes (random tie picks);
+  fix17 run1 vs run2 moved 0, residual ≤ 1e-5 on EM-split entries (parsimony-EM float order, not forseti).
 - `spliceu` FASTA load: `record.id()` is the full header; no check `spliceu_txome.len()==ref_count`
   (`quant.rs:1533-1538`). Split at whitespace and assert.
-- `--max-frag-len` (default 1000) is not validated against the spline length (1011); > 1010 panics on
-  slice (`forseti.rs:499`).
+- ~~`--max-frag-len` (default 1000) is not validated against the spline length (1011); > 1010 panics on
+  slice (`forseti.rs:499`).~~ **Fixed (fix16):** `quant.rs` bails after the spline loads; `main.rs` now
+  returns the error chain instead of `panic!("could not quantify rad file.")`, which used to hide it.
 
 ---
 

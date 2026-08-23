@@ -1529,6 +1529,19 @@ pub fn do_quantify_forseti<T: BufRead, B >(
 
             // -------------------load spline model---------------
             let spline_lookup = load_spline_lookup_table_from_str(SPLINE_TABLE_JSON)?;
+            // forseti slices the spline as `[start_idx..end_idx]` with
+            // `end_idx <= max_frag_len + 1`, so the table must hold at least
+            // max_frag_len + 1 entries; otherwise a wide window panics in a
+            // worker thread instead of failing here with a clear message.
+            if (max_frag_len as usize) + 1 > spline_lookup.len() {
+                anyhow::bail!(
+                    "--max-frag-len {} exceeds the fragment-length spline table \
+                     (length {}); the maximum supported value is {}",
+                    max_frag_len,
+                    spline_lookup.len(),
+                    spline_lookup.len() - 1
+                );
+            }
 
             // -------prepare spliceu_txome------------
             let mut spliceu_txome: HashMap<u32, Vec<u8>> = HashMap::new();

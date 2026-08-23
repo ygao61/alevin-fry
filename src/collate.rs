@@ -493,7 +493,11 @@ where
     let max_rec = max_records as usize;
     let num_buckets = temp_buckets.len();
     let num_threads = n_workers;
-    let loc_buffer_size = (min_rec_len + (most_ambig_record * 4_usize) - 4_usize).max(
+    // The buffer must fit one maximally-ambiguous record. The old formula assumed
+    // 4 B/alignment; the position-carrying record needs 8 B/alignment. Using the
+    // record type's own nbytes() handles both.
+    let max_rec_len = R::nbytes(most_ambig_record as u32, &rec_context);
+    let loc_buffer_size = max_rec_len.max(
         (1000_usize.max((min_rec_len * max_rec) / (num_buckets * num_threads))).min(262_144_usize),
     ); //131072_usize);
 

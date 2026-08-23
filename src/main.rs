@@ -570,15 +570,16 @@ fn main() -> anyhow::Result<()> {
                                 ErrorKind::Deserialize { .. } => {
                                     return Err(anyhow!("execution terminated unexpectedly"));
                                 }
-                                // if another type of error, just panic for now
+                                // if another type of error, report it with its context
                                 _ => {
-                                    panic!("could not quantify rad file.");
+                                    return Err(e.context("could not quantify rad file"));
                                 }
                             }
                         }
-                        // if something else, just panic
+                        // if something else, surface the underlying error instead of
+                        // panicking with a generic message (e.g. a bail!() in quant)
                         None => {
-                            panic!("could not quantify rad file.");
+                            return Err(e.context("could not quantify rad file"));
                         }
                     },
                 }; // end match if
@@ -595,15 +596,16 @@ fn main() -> anyhow::Result<()> {
                                 ErrorKind::Deserialize { .. } => {
                                     return Err(anyhow!("execution terminated unexpectedly"));
                                 }
-                                // if another type of error, just panic for now
+                                // if another type of error, report it with its context
                                 _ => {
-                                    panic!("could not quantify rad file.");
+                                    return Err(e.context("could not quantify rad file"));
                                 }
                             }
                         }
-                        // if something else, just panic
+                        // if something else, surface the underlying error instead of
+                        // panicking with a generic message (e.g. a bail!() in quant)
                         None => {
-                            panic!("could not quantify rad file.");
+                            return Err(e.context("could not quantify rad file"));
                         }
                     },
                 }; //end quant if

@@ -1,159 +1,27 @@
+#[cfg(feature = "forseti-shadow")]
 use crate::mlp_spline::NativeMlp;
-use anyhow::{Context, Result, bail};
+use crate::track::TrackStore;
+use anyhow::{bail, Context, Result};
 use ndarray::prelude::*;
-use ndarray::{Array1, Array2};
 use ndarray::s;
-use serde_json::Value;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::sync::atomic::{AtomicU64, Ordering};
+
 type CoveringTxpId = u32;
-/// RAD alignment tuple: (is_reverse, ref_start)
+/// RAD alignment tuple: (is_forward, ref_start)
 type AlgnTuple = (bool, u32);
 /// One entry per `check_mcc_list` element, in the same order, so the position in
 /// this Vec *is* the MCC index reported back to the caller. A Vec (rather than a
 /// HashMap keyed by that index) keeps candidate iteration order fixed across runs.
 pub type ForsetiCheckingList = Vec<(CoveringTxpId, Vec<AlgnTuple>)>;
-use memchr::memmem;
 
-
-fn reverse_complement(seq: &str) -> Result<String, String> {
-    let complement = |base: char| match base {
-        'A' | 'a' => Ok('T'),
-        'T' | 't' => Ok('A'),
-        'C' | 'c' => Ok('G'),
-        'G' | 'g' => Ok('C'),
-        'N' | 'n' => Ok('N'),
-        _ => Err(format!("Invalid nucleotide found: {}", base)),
-    };
-
-    seq.chars().rev().map(complement).collect() // Collect into a Result<String, _>
-}
-
-#[allow(dead_code)]
-fn build_kmers(sequence: &str, ksize: usize) -> Vec<String> {
-    // If the sequence is shorter than k, there are no valid k-mers.
-    // IMPORTANT: using saturating_sub here is *not* sufficient because it would yield 1
-    // and then attempt to slice `sequence[0..ksize]`, which panics.
-    if sequence.len() < ksize {
-        return Vec::new();
-    }
-    let n_kmers = sequence.len() - ksize + 1;
-    (0..n_kmers)
-        .map(|i| sequence[i..i + ksize].to_string())
-        .collect()
-}
-
-// fn __work_one_hot_encoder(kmer_list: &[String], has_enough_a: &[bool]) -> Array2<f32> {
-//     let nucleotides = ['A', 'C', 'G', 'T', 'N'];
-//     let num_classes = nucleotides.len();
-
-//     // Create a mapping from ASCII codes to indices
-//     let mut code_to_idx = [-1i32; 256];
-//     for (i, &nuc) in nucleotides.iter().enumerate() {
-//         code_to_idx[nuc as usize] = i as i32;
-//     }
-
-//     // Filter valid kmers
-//     let valid_kmers: Vec<&String> = kmer_list
-//         .iter()
-//         .zip(has_enough_a)
-//         .filter_map(|(kmer, &has_a)| if has_a { Some(kmer) } else { None })
-//         .collect();
-
-//     if valid_kmers.is_empty() {
-//         return Array2::<f32>::zeros((0, 0));
-//     }
-
-//     let num_sequences = valid_kmers.len();
-//     let sequence_length = valid_kmers[0].len();
-
-//     // Prepare the output array
-//     let mut one_hot = Array2::<f32>::zeros((num_sequences, sequence_length * num_classes));
-
-//     for (i, seq) in valid_kmers.iter().enumerate() {
-//         let seq_bytes = seq.as_bytes();
-//         for (j, &byte) in seq_bytes.iter().enumerate() {
-//             let idx = code_to_idx[byte as usize];
-//             let idx = idx as usize;
-//             one_hot[(i, j * num_classes + idx)] = 1.0;
-//         }
-//     }
-
-//     one_hot
-// }
-#[allow(dead_code)]
-fn one_hot_encoder(kmer_list: &[String], has_enough_a: &Array1<bool>) -> Array2<f32> {
-    let nucleotides = ['A', 'C', 'G', 'T', 'N'];
-    let num_classes = nucleotides.len();
-
-    // Create a mapping from ASCII codes to indices
-    let mut code_to_idx = [-1i32; 256];
-    for (i, &nuc) in nucleotides.iter().enumerate() {
-        code_to_idx[nuc as usize] = i as i32;
-    }
-
-    // Filter valid kmers using ndarray boolean masking
-    let valid_kmers: Vec<&String> = kmer_list
-        .iter()
-        .zip(has_enough_a.iter())
-        .filter_map(|(kmer, &has_a)| if has_a { Some(kmer) } else { None })
-        .collect();
-
-    if valid_kmers.is_empty() {
-        return Array2::<f32>::zeros((0, 0));
-    }
-
-    let num_sequences = valid_kmers.len();
-    let sequence_length = valid_kmers[0].len();
-
-    // Prepare the output array
-    let mut one_hot = Array2::<f32>::zeros((num_sequences, sequence_length * num_classes));
-
-    // Process each kmer
-    for (i, seq) in valid_kmers.iter().enumerate() {
-        let seq_bytes = seq.as_bytes();
-        let indices: Vec<usize> = seq_bytes
-            .iter()
-            .map(|&byte| code_to_idx[byte as usize] as usize)
-            .collect();
-
-        // Vectorized one-hot encoding for the current sequence
-        for (j, &idx) in indices.iter().enumerate() {
-            one_hot[(i, j * num_classes + idx)] = 1.0;
-        }
-    }
-
-    one_hot
-}
-
-fn load_spline_lookup_table(file_path: &str) -> Result<Array1<f64>> {
-    // Open the file
-    let file = File::open(file_path)?;
-    let reader = BufReader::new(file);
-
-    // Parse the JSON
-    let json_data: Value = serde_json::from_reader(reader)?;
-
-    // Extract the "y" field as an array
-    if let Some(y_values) = json_data["y"].as_array() {
-        // Convert JSON array to Vec<f64>
-        let y_vec: Vec<f64> = y_values
-            .iter()
-            .map(|v| v.as_f64().unwrap_or(0.0)) // Ensure conversion
-            .collect();
-
-        // Convert Vec<f64> to ndarray::Array1
-        Ok(Array1::from(y_vec))
-    } else {
-        Err(anyhow::anyhow!("Missing 'y' field in JSON"))
-    }
-}
 /// Allocation-free 6A detection. For each k-mer window start `i` in `[0, len-k]`,
 /// returns whether `bytes[i..i+k]` contains a run of >= `min_run` consecutive b'A'.
 /// O(len) via a difference array; bit-equivalent to the old per-k-mer
 /// `memmem::find(window, "A"*min_run).is_some()` but with zero String allocations.
-fn compute_has_6a(bytes: &[u8], k: usize, min_run: usize) -> Array1<bool> {
+pub(crate) fn compute_has_6a(bytes: &[u8], k: usize, min_run: usize) -> Array1<bool> {
     if bytes.len() < k {
         return Array1::from(Vec::<bool>::new());
     }
@@ -186,120 +54,6 @@ fn compute_has_6a(bytes: &[u8], k: usize, min_run: usize) -> Array1<bool> {
         hot[i] = acc > 0;
     }
     Array1::from(hot)
-}
-
-use std::cell::RefCell;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-// Global hit/miss counters for the per-thread MLP affinity cache. One atomic add
-// per process_binding_affinity call (not per 30-mer) -> negligible contention.
-// Read at end of run via `mlp_cache_stats()` to report the hit rate.
-pub static MLP_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
-pub static MLP_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
-
-/// (hits, misses) for the MLP affinity cache so far.
-pub fn mlp_cache_stats() -> (u64, u64) {
-    (
-        MLP_CACHE_HITS.load(Ordering::Relaxed),
-        MLP_CACHE_MISSES.load(Ordering::Relaxed),
-    )
-}
-
-thread_local! {
-    // packed 30-mer -> FINAL affinity (post discount / all-A / threshold). Per-thread
-    // => no locks, scales with -t. Recurrent multimap loci (Hmgb2 cluster, ribosomal
-    // pseudogenes) appear in every cell, so each worker's cache fills within a few cells.
-    static MLP_AFFINITY_CACHE: RefCell<HashMap<u64, f64>> = RefCell::new(HashMap::new());
-}
-
-/// Pack a k-mer (k <= 32) of A/C/G/T into a u64 (2 bits/base). None if any base is
-/// not A/C/G/T (e.g. N) -> those are computed each time but never cached.
-#[inline]
-fn pack_kmer(bytes: &[u8], start: usize, k: usize) -> Option<u64> {
-    let mut key = 0u64;
-    for j in 0..k {
-        let code = match bytes[start + j] {
-            b'A' => 0u64,
-            b'C' => 1,
-            b'G' => 2,
-            b'T' => 3,
-            _ => return None,
-        };
-        key = (key << 2) | code;
-    }
-    Some(key)
-}
-
-fn process_binding_affinity(
-    bytes: &[u8],
-    k: usize,
-    has_enough_a: &Array1<bool>,
-    mlp: &NativeMlp,
-    discount_perc: f64,
-    binding_affinity_threshold: f64,
-) -> Result<Array1<f64>> {
-    // hot window-start indices
-    let indices: Vec<usize> = has_enough_a
-        .indexed_iter()
-        .filter_map(|(i, &val)| if val { Some(i) } else { None })
-        .collect();
-
-    let mut out = Array1::<f64>::zeros(has_enough_a.len());
-
-    // 1) split hot 30-mers into cache HITS (fill `out` directly) and MISSES (need MLP)
-    let mut miss_start: Vec<usize> = Vec::new();
-    let mut miss_key: Vec<Option<u64>> = Vec::new();
-    let mut hits: u64 = 0;
-    MLP_AFFINITY_CACHE.with(|c| {
-        let cache = c.borrow();
-        for &start in &indices {
-            let key = pack_kmer(bytes, start, k);
-            if let Some(kk) = key {
-                if let Some(&aff) = cache.get(&kk) {
-                    out[start] = aff;
-                    hits += 1;
-                    continue;
-                }
-            }
-            miss_start.push(start);
-            miss_key.push(key);
-        }
-    });
-
-    // 2) one batched MLP forward on the MISSES only, then post-process + cache
-    if !miss_start.is_empty() {
-        debug_assert_eq!(k, mlp.k());
-        let mut nonzero = mlp.predict_starts(bytes, &miss_start);
-        if nonzero.len() != miss_start.len() {
-            return Err(anyhow::anyhow!(
-                "Mismatched dimensions between binding affinity and has_enough_a"
-            ));
-        }
-        nonzero *= discount_perc;
-        MLP_AFFINITY_CACHE.with(|c| {
-            let mut cache = c.borrow_mut();
-            for (j, &start) in miss_start.iter().enumerate() {
-                // identical post-processing as before: all-A -> 1.0; <= threshold -> 0.0
-                let aff = if bytes[start..start + k].iter().all(|&b| b == b'A') {
-                    1.0
-                } else if nonzero[j] <= binding_affinity_threshold {
-                    0.0
-                } else {
-                    nonzero[j]
-                };
-                out[start] = aff;
-                if let Some(kk) = miss_key[j] {
-                    cache.insert(kk, aff);
-                }
-            }
-        });
-    }
-
-    // 3) record hit/miss (one atomic add each per call)
-    MLP_CACHE_HITS.fetch_add(hits, Ordering::Relaxed);
-    MLP_CACHE_MISSES.fetch_add(miss_start.len() as u64, Ordering::Relaxed);
-
-    Ok(out)
 }
 
 pub fn build_status_lookup(
@@ -350,7 +104,26 @@ pub fn build_status_lookup(
     Ok(status_lookup)
 }
 
-pub fn forseti_for_multi_best(
+/// Number of (candidate lists, scored candidates, mismatching candidates)
+/// seen by the shadow comparison; all zero unless built with
+/// `--features forseti-shadow`.
+pub static SHADOW_LISTS: AtomicU64 = AtomicU64::new(0);
+pub static SHADOW_CANDIDATES: AtomicU64 = AtomicU64::new(0);
+pub static SHADOW_MISMATCHES: AtomicU64 = AtomicU64::new(0);
+
+pub fn shadow_stats() -> (u64, u64, u64) {
+    (
+        SHADOW_LISTS.load(Ordering::Relaxed),
+        SHADOW_CANDIDATES.load(Ordering::Relaxed),
+        SHADOW_MISMATCHES.load(Ordering::Relaxed),
+    )
+}
+
+/// Shadow mode: re-score the same real candidate list with the frozen fix18
+/// reference and compare every score bit-for-bit. Mismatches are counted and
+/// the first few are printed with enough context to replay them.
+#[cfg(feature = "forseti-shadow")]
+fn shadow_check(
     forseti_checking_list: &ForsetiCheckingList,
     ref_names: &[String],
     spliceu_txome: &HashMap<u32, Vec<u8>>,
@@ -358,40 +131,120 @@ pub fn forseti_for_multi_best(
     mlp: &NativeMlp,
     read_length: u16,
     max_frag_len: u16,
-) -> Result<Vec<u16>> {
-    // Set up parameters
-    let snr_min_size = 6;
-    let discount_perc = 1.0_f64;
-    let polya_tail_len = 200;
-    let max_frag_len = max_frag_len;
-    let binding_affinity_threshold = 0.0;
-    // 6A detection is done allocation-free in compute_has_6a (uses snr_min_size).
+    scored: &[(u16, f64)],
+) {
+    const PRINT_LIMIT: u64 = 20;
+    let want = match crate::forseti_reference::reference_score_candidates(
+        forseti_checking_list,
+        ref_names,
+        spliceu_txome,
+        spline_lookup,
+        mlp,
+        read_length,
+        max_frag_len,
+    ) {
+        Ok(w) => w,
+        Err(e) => {
+            let n = SHADOW_MISMATCHES.fetch_add(1, Ordering::Relaxed);
+            if n < PRINT_LIMIT {
+                eprintln!("[forseti-shadow] reference errored: {e}; list {:?}", forseti_checking_list);
+            }
+            return;
+        }
+    };
+    SHADOW_LISTS.fetch_add(1, Ordering::Relaxed);
+    SHADOW_CANDIDATES.fetch_add(scored.len() as u64, Ordering::Relaxed);
+    let same = scored.len() == want.len()
+        && scored
+            .iter()
+            .zip(want.iter())
+            .all(|(&(gi, gs), &(wi, ws))| gi == wi && gs.to_bits() == ws.to_bits());
+    if !same {
+        let n = SHADOW_MISMATCHES.fetch_add(1, Ordering::Relaxed);
+        if n < PRINT_LIMIT {
+            eprintln!(
+                "[forseti-shadow] MISMATCH #{}: rl {} mfl {}\n  got  {:?}\n  want {:?}\n  list {:?}",
+                n + 1, read_length, max_frag_len, scored, want, forseti_checking_list
+            );
+        }
+    }
+}
 
-    // Avoid turning stderr into the bottleneck when many MCCs are skipped.
-    const INVALID_POS_PRINT_LIMIT: u64 = 2;
-    let mut invalid_pos_skipped: u64 = 0;
+pub fn forseti_for_multi_best(
+    forseti_checking_list: &ForsetiCheckingList,
+    ref_names: &[String],
+    spliceu_txome: &HashMap<u32, Vec<u8>>,
+    spline_lookup: &Array1<f64>,
+    tracks: &TrackStore,
+    read_length: u16,
+    max_frag_len: u16,
+) -> Result<Vec<u16>> {
+    let scored = forseti_score_candidates(
+        forseti_checking_list,
+        ref_names,
+        spliceu_txome,
+        spline_lookup,
+        tracks,
+        read_length,
+        max_frag_len,
+    )?;
+    #[cfg(feature = "forseti-shadow")]
+    shadow_check(
+        forseti_checking_list,
+        ref_names,
+        spliceu_txome,
+        spline_lookup,
+        tracks.mlp(),
+        read_length,
+        max_frag_len,
+        &scored,
+    );
+    Ok(select_best_mcc_indices(&scored))
+}
+
+/// Score every candidate (MCC, transcript) pair in `forseti_checking_list`.
+///
+/// Returns `(mcc_idx, normalised max joint log-probability)` in check-list
+/// order; a candidate that reaches the end of the loop without a usable
+/// window is recorded with `f64::NEG_INFINITY`, candidates skipped by an
+/// early `continue` are not recorded at all.
+///
+/// fix19: the binding affinities come from the per-transcript hot-position
+/// tracks (`track.rs`) and each window is scored as a scan over its hot
+/// positions only. See the `track` module docs for why this is exactly the
+/// fix18 result; `forseti_reference` holds the fix18 code and the test
+/// `production_scoring_matches_frozen_reference` (plus the
+/// `forseti-shadow` build feature on real data) checks bit-equality.
+pub(crate) fn forseti_score_candidates(
+    forseti_checking_list: &ForsetiCheckingList,
+    ref_names: &[String],
+    spliceu_txome: &HashMap<u32, Vec<u8>>,
+    spline_lookup: &Array1<f64>,
+    tracks: &TrackStore,
+    read_length: u16,
+    max_frag_len: u16,
+) -> Result<Vec<(u16, f64)>> {
+    let polya_tail_len = 200;
+    let max_frag_len = max_frag_len as usize;
 
     // Reusable buffers to reduce per-MCC allocations.
     let mut ref_start_list: Vec<usize> = Vec::new();
     let mut ref_end_list: Vec<usize> = Vec::new();
-    // reusable sum buffers for accumulating joint probabilities across alignments
-    let mut sum_log_probs: Vec<f64> = Vec::new();
     let mut tail_sum_log_probs: Vec<f64> = Vec::new();
+    // hot positions of the current window, from the track store
+    let mut hot: Vec<(u32, f32)> = Vec::new();
     const EPS: f64 = 1e-12;
     // Every "affinity == 0" term is ln(0*frag_prob + EPS) = ln(EPS), a constant.
-    // ~98% of 30-mers have affinity 0, so add this instead of calling the costly .ln().
     let ln_eps = EPS.ln();
-    // Per-candidate scores; the winner set is chosen in a second pass below.
+    // Per-candidate scores; the winner set is chosen by the caller.
     let mut scored: Vec<(u16, f64)> = Vec::new();
 
-
     // Candidates are visited in check_mcc_list order (mcc_idx ascending), so the
-    // order of the returned winner list is deterministic.
-    // algn_tuple_list is direction(fw, reverse) and ref_start
+    // order of the returned list is deterministic.
     for (mcc_idx, (covering_txp_id, algn_tuple_list)) in forseti_checking_list.iter().enumerate() {
         let mut norm_sum_joint_prob = f64::NEG_INFINITY;
 
-        let ref_seq_bytes = match spliceu_txome.get(covering_txp_id) {
+        let ref_seq = match spliceu_txome.get(covering_txp_id) {
             Some(seq) => seq.as_slice(),
             None => {
                 let nm = ref_names
@@ -402,10 +255,7 @@ pub fn forseti_for_multi_best(
                 continue;
             }
         };
-        // SAFETY: the spliceu reference is DNA (A/C/G/T/N) -> always valid ASCII -> valid
-        // UTF-8, so validation can never fail. `from_utf8` would re-scan the whole
-        // transcript (up to ~45 kb) on every candidate (~4% of runtime); skip it.
-        let ref_seq = unsafe { std::str::from_utf8_unchecked(ref_seq_bytes) };
+        let tid = *covering_txp_id;
         let tx_ref_end = ref_seq.len();
         let all_forward = algn_tuple_list.iter().all(|algn_tuple| algn_tuple.0);
         let all_reverse = algn_tuple_list.iter().all(|algn_tuple| !algn_tuple.0);
@@ -417,11 +267,11 @@ pub fn forseti_for_multi_best(
             ref_start_list.clear();
             ref_start_list.reserve(algn_tuple_list.len());
             for &(_is_forward, ref_start_u32) in algn_tuple_list.iter() {
-                // NOTE: Mimic softclip
-                // TODO:we could have a better way to handle this. if we can use signed int for the ref_start, we could know the length of overhang/clipping.
+                // NOTE: Mimic softclip: a start "close to 2^32" is a clipped
+                // alignment and is treated as position 0.
                 if ref_start_u32 > invalid_pos_limit {
-                    ref_start_list.push(0 as usize);
-                }else{
+                    ref_start_list.push(0usize);
+                } else {
                     let rs = ref_start_u32 as usize;
                     if rs > tx_ref_end {
                         println!("ref_start: {}", rs);
@@ -432,134 +282,79 @@ pub fn forseti_for_multi_best(
                     ref_start_list.push(rs);
                 }
             }
-            if mcc_invalid{
+            if mcc_invalid {
                 continue;
             }
             if ref_start_list.is_empty() {
                 eprintln!("ref_start_list is empty! Should not happen.");
                 continue;
             }
+            let n_alns = ref_start_list.len() as f64;
 
             let overlap_wdow_start = *ref_start_list.iter().max().unwrap();
-            let overlap_wdow_end = *ref_start_list.iter().min().unwrap() + max_frag_len as usize;
+            let overlap_wdow_end = *ref_start_list.iter().min().unwrap() + max_frag_len;
             if overlap_wdow_start >= overlap_wdow_end {
                 continue;
             }
 
-            // Downstream processing
-            // if we have >30 bases downstream, we want to consider internal polyA sites
-            // we use > 30 because the polyA should start one base after the window range start
+            // Downstream (internal poly-A) arm: 30-mers of
+            // ref[ws+1 .. min(we+30, tx_end)), i.e. starts p in [ws+1, e-30].
             if tx_ref_end - overlap_wdow_start > 30 {
-                let downstream_seq = &ref_seq
-                    [(overlap_wdow_start + 1)..usize::min(overlap_wdow_end + 30, tx_ref_end)];
-                let ds_bytes = downstream_seq.as_bytes();
-                let has_enough_a = compute_has_6a(ds_bytes, 30, snr_min_size);
-                if has_enough_a.is_empty() {
+                let e = usize::min(overlap_wdow_end + 30, tx_ref_end);
+                if e - (overlap_wdow_start + 1) < 30 {
+                    // fewer than one 30-mer in the window (fix18: has_enough_a empty)
                     continue;
                 }
-                let n_kmers = has_enough_a.len();
-                // if any of the 30mers has enough A, we can process the binding affinity for this mcc
-                if has_enough_a.iter().any(|&x| x) {
-                    let downstream_binding_affinity = process_binding_affinity(
-                        ds_bytes,
-                        30,
-                        &has_enough_a,
-                        mlp,
-                        discount_perc,
-                        binding_affinity_threshold,
-                    )?;
-
-                    sum_log_probs.clear();
-                    sum_log_probs.resize(n_kmers, 0.0);
-
-                    // for each alignment, we compute the prob. distanse = (each algn's start to the overlapped window end), while poly A range is overlap wdow start to end.
-                    for &ref_start in &ref_start_list {
-                        let prefix_dis = overlap_wdow_start - ref_start;
-                        let start_idx = prefix_dis + 1;
-                        let end_idx = prefix_dis + n_kmers + 1;
-                        let downstream_frag_len_prob = spline_lookup.slice(s![start_idx..end_idx]);
-                        for (i, (&affinity, &frag_prob)) in downstream_binding_affinity
-                            .iter()
-                            .zip(downstream_frag_len_prob.iter())
-                            .enumerate()
-                        {
-                            // avoid log(0), + EPS; affinity==0 (~98% of 30-mers) -> ln(EPS) constant
-                            sum_log_probs[i] += if affinity == 0.0 {
+                tracks.fwd_hot(tid, ref_seq, overlap_wdow_start + 1, e - 30, &mut hot);
+                if !hot.is_empty() {
+                    let mut max_sum_log = f64::NEG_INFINITY;
+                    for &(p, aff) in hot.iter() {
+                        let affinity = aff as f64;
+                        let p = p as usize;
+                        let mut sum_log_prob = 0.0f64;
+                        for &ref_start in &ref_start_list {
+                            let frag_prob = spline_lookup[p - ref_start];
+                            sum_log_prob += if affinity == 0.0 {
                                 ln_eps
                             } else {
                                 (affinity * frag_prob + EPS).ln()
                             };
                         }
+                        max_sum_log = f64::max(max_sum_log, sum_log_prob);
                     }
-
-                    let max_sum_log = sum_log_probs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
                     // make it comparable across different n_alns
-                    norm_sum_joint_prob = max_sum_log / ref_start_list.len() as f64;
+                    norm_sum_joint_prob = max_sum_log / n_alns;
                 }
             }
-            // the downstream window end is beyond the last 30 mer of the ref, we could borrow A from the poly A tail.
-            // And, we only compute the case that we consider borrowed A from tail(avoid duplicate computation for cases above, pure internal polyA)
-            if overlap_wdow_end > tx_ref_end - 30 {
+
+            // Tail arm: the window runs past the last 30-mer of the reference, so
+            // borrow A's from the poly-A tail (virtual 30-mers = last 29-j bases +
+            // j+1 A's, at most 15; beyond that a window counts as pure poly-A).
+            // `tx_ref_end >= 30` mirrors fix18's `we > tx_end - 30` in release
+            // arithmetic (a shorter reference wrapped and never took this arm).
+            if tx_ref_end >= 30 && overlap_wdow_end > tx_ref_end - 30 {
                 let needed_extra_a_len = 30 + overlap_wdow_end - tx_ref_end;
-                // Build tail 30-mers with extra added "A"s from polyA tail
-                // at most we add 15 extra A, since when 30mer has >15A, we will consider this as polyA tail. no need to add more& we can be efficient.
-                let tail_seq = format!(
-                    "{}{}",
-                    &ref_seq[tx_ref_end.saturating_sub(30 - 1)..],
-                    "A".repeat(needed_extra_a_len.min(15))
-                );
-                let tail_bytes = tail_seq.as_bytes();
-                let has_enough_a = compute_has_6a(tail_bytes, 30, snr_min_size);
-                let n_tail = has_enough_a.len();
+                let n_tail = needed_extra_a_len.min(15);
 
-                let tail_binding_affinity = if has_enough_a.iter().any(|&x| x) {
-                    process_binding_affinity(
-                        tail_bytes,
-                        30,
-                        &has_enough_a,
-                        mlp,
-                        discount_perc,
-                        binding_affinity_threshold,
-                    )?
-                } else {
-                    Array1::zeros(n_tail)
-                };
-
-                // Compute joint probabilities for the tail
-                let all_a_prob = 1.0;
-
-                // ovlp_wdow_dis_to_tx_end_30mer is the region we already computedin above downstream branch; (overlap_wdow_end  - overlap_wdow_start + 1)is the length of the shared sliding window.
-                // let ovlp_wdow_dis_to_tx_end_30mer = tx_ref_end - 30 + 1 - overlap_wdow_start;
-                let tx_end_30mer_start = tx_ref_end.saturating_sub(29); // = tx_ref_end - 30 + 1
+                let tx_end_30mer_start = tx_ref_end.saturating_sub(29);
                 if overlap_wdow_start >= tx_end_30mer_start {
-                    continue; // skip the overhanging cases
+                    continue; // skip the overhanging cases (drops the candidate, as before)
                 }
                 let ovlp_wdow_dis_to_tx_end_30mer = tx_end_30mer_start - overlap_wdow_start;
-
-                let ovlp_wdow_length = (overlap_wdow_end  - overlap_wdow_start + 1)
-                .min(ovlp_wdow_dis_to_tx_end_30mer + 1 + polya_tail_len);
+                let ovlp_wdow_length = (overlap_wdow_end - overlap_wdow_start + 1)
+                    .min(ovlp_wdow_dis_to_tx_end_30mer + 1 + polya_tail_len);
                 let valid_len = ovlp_wdow_length.saturating_sub(ovlp_wdow_dis_to_tx_end_30mer);
+
+                let tail_aff = tracks.tail(tid, ref_seq);
                 tail_sum_log_probs.clear();
                 tail_sum_log_probs.resize(valid_len, 0.0);
-                // tail_joint_prob length is determined per-alignment
                 for &ref_start in &ref_start_list {
-                    // here we compute the ovlp_start to the last 30 mer of the ref
-                    // because this is the cases we did not covered by the above arm(downstream window end is within the ref)
-
                     let prefix_dis = overlap_wdow_start - ref_start;
                     let start_idx = prefix_dis + ovlp_wdow_dis_to_tx_end_30mer;
-                    // NOTE: predfix_dis is the per algn dis;
-                    let end_idx = prefix_dis+ ovlp_wdow_length;
-
+                    let end_idx = prefix_dis + ovlp_wdow_length;
                     let tail_frag_len_prob = spline_lookup.slice(s![start_idx..end_idx]);
-
-                    // Update joint probabilities with tail_binding_affinity
                     for (i, frag_prob) in tail_frag_len_prob.iter().enumerate() {
-                        let affinity = if i < n_tail {
-                             tail_binding_affinity[i]
-                        } else {
-                             all_a_prob // All A probability; if we got >15 A, also apply all A probability, as this is more likely to be polyA tail mode, not internal polyA mode.
-                        };
+                        let affinity = if i < n_tail { tail_aff[i] as f64 } else { 1.0 };
                         tail_sum_log_probs[i] += if affinity == 0.0 {
                             ln_eps
                         } else {
@@ -567,15 +362,11 @@ pub fn forseti_for_multi_best(
                         };
                     }
                 }
-
-                // Sum and normalize joint probabilities for the tail
                 let max_log = tail_sum_log_probs
-                .iter()
-                .cloned()
-                .fold(f64::NEG_INFINITY, f64::max);
-
-                let norm_max_tail_log = max_log / ref_start_list.len() as f64;
-
+                    .iter()
+                    .cloned()
+                    .fold(f64::NEG_INFINITY, f64::max);
+                let norm_max_tail_log = max_log / n_alns;
                 if norm_max_tail_log > norm_sum_joint_prob {
                     norm_sum_joint_prob = norm_max_tail_log;
                 }
@@ -583,13 +374,12 @@ pub fn forseti_for_multi_best(
         } else if all_reverse {
             ref_end_list.clear();
             ref_end_list.reserve(algn_tuple_list.len());
-
             for &(_is_reverse, ref_start_u32) in algn_tuple_list.iter() {
                 let mut ref_start = ref_start_u32 as usize;
                 if ref_start_u32 > invalid_pos_limit {
-                // mimic softclip
-                    ref_start = 0 as usize;
-                }else if ref_start > tx_ref_end{
+                    // mimic softclip
+                    ref_start = 0usize;
+                } else if ref_start > tx_ref_end {
                     eprintln!("Error: ref_start is not close to 2^32, but exceed ref length. This should not happen.");
                     mcc_invalid = true;
                     break;
@@ -600,10 +390,10 @@ pub fn forseti_for_multi_best(
                     .min(tx_ref_end);
                 ref_end_list.push(ref_end);
             }
-
-            if mcc_invalid{
+            if mcc_invalid {
                 continue;
             }
+            let n_alns = ref_end_list.len() as f64;
 
             let overlap_wdow_end = *ref_end_list.iter().min().unwrap();
             let overlap_wdow_start = ref_end_list
@@ -611,71 +401,61 @@ pub fn forseti_for_multi_best(
                 .cloned()
                 .max()
                 .unwrap()
-                .saturating_sub(max_frag_len as usize);
+                .saturating_sub(max_frag_len);
             if overlap_wdow_start >= overlap_wdow_end {
                 continue;
             }
 
             if overlap_wdow_end > 30 {
+                // Upstream (antisense) arm: reverse complement of
+                // ref[start_pos .. end_pos); rc 30-mer i ends at forward q = end_pos - i,
+                // so q runs over [start_pos + 30, end_pos].
                 let start_pos = overlap_wdow_start.max(30);
                 let end_pos = overlap_wdow_end.min(tx_ref_end);
                 if end_pos <= start_pos {
                     continue;
                 }
-                let seq_slice = &ref_seq[start_pos..end_pos];
-                let rev_comp_seq = reverse_complement(seq_slice).unwrap();
-
-                // Build kmers
-                let rc_bytes = rev_comp_seq.as_bytes();
-                let has_enough_a = compute_has_6a(rc_bytes, 30, snr_min_size);
-                let n_up = has_enough_a.len();
-
-                if has_enough_a.iter().any(|&x| x) {
-                    let upstream_binding_affinity = process_binding_affinity(
-                        rc_bytes,
-                        30,
-                        &has_enough_a,
-                        mlp,
-                        discount_perc,
-                        binding_affinity_threshold,
-                    )?;
-                    // New: add penalty for antisense reads
-                    let anti_sense_penalty = 0.8;
-                    // For each alignment, compute fragment length probabilities
-                    sum_log_probs.clear();
-                    sum_log_probs.resize(n_up, 0.0);
-                    for &ref_end in &ref_end_list {
-                        let suffix_dis = ref_end - overlap_wdow_end;
-                        let start_idx = suffix_dis + 1;
-                        let end_idx = n_up + suffix_dis + 1;
-                        let upstream_frag_len_prob = spline_lookup.slice(s![start_idx..end_idx]);
-                        for (i, (&affinity, &frag_prob)) in upstream_binding_affinity
-                            .iter()
-                            .zip(upstream_frag_len_prob.iter())
-                            .enumerate()
-                        {
-                            sum_log_probs[i] += if affinity == 0.0 {
-                                ln_eps
-                            } else {
-                                (affinity * frag_prob * anti_sense_penalty + EPS).ln()
-                            };
+                if end_pos - start_pos >= 30 {
+                    tracks.rc_hot(tid, ref_seq, start_pos + 30, end_pos, &mut hot);
+                    if !hot.is_empty() {
+                        // New: add penalty for antisense reads
+                        let anti_sense_penalty = 0.8;
+                        let mut max_sum = f64::NEG_INFINITY;
+                        for &(q, aff) in hot.iter() {
+                            let affinity = aff as f64;
+                            let q = q as usize;
+                            let mut sum_log_prob = 0.0f64;
+                            for &ref_end in &ref_end_list {
+                                let frag_prob = spline_lookup[ref_end - q + 1];
+                                sum_log_prob += if affinity == 0.0 {
+                                    ln_eps
+                                } else {
+                                    (affinity * frag_prob * anti_sense_penalty + EPS).ln()
+                                };
+                            }
+                            max_sum = f64::max(max_sum, sum_log_prob);
                         }
+                        norm_sum_joint_prob = max_sum / n_alns;
                     }
-                    let max_sum = sum_log_probs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                    norm_sum_joint_prob = max_sum / ref_end_list.len() as f64;
                 }
-            }else{
+            } else {
                 continue;
             }
-        }else{
+        } else {
             eprintln!("Error: algn_tuple_list is not all forward or all reverse. This should not happen.");
             continue;
         }
 
-        // Just record the score here; the winner set is picked below.
+        // Just record the score here; the winner set is picked by the caller.
         scored.push((mcc_idx as u16, norm_sum_joint_prob));
     }
 
+    Ok(scored)
+}
+
+/// Pick the winner set from per-candidate scores: the true maximum first,
+/// then every candidate within `TIE_EPS` of it, in mcc_idx order.
+pub(crate) fn select_best_mcc_indices(scored: &[(u16, f64)]) -> Vec<u16> {
     // Take the true maximum first, then collect every candidate within TIE_EPS
     // of it. The previous single running-max pass was order dependent: "within
     // TIE_EPS" is not transitive, so a candidate that ties against one anchor is
@@ -690,13 +470,11 @@ pub fn forseti_for_multi_best(
     if max_score == f64::NEG_INFINITY {
         // No candidate could be scored at all; forseti abstains and the caller
         // keeps the labels it held before calling us.
-        return Ok(Vec::new());
+        return Vec::new();
     }
-    let best_mcc_indices: Vec<u16> = scored
+    scored
         .iter()
         .filter(|&&(_, score)| score != f64::NEG_INFINITY && (max_score - score) <= TIE_EPS)
         .map(|&(mcc_idx, _)| mcc_idx)
-        .collect();
-
-    Ok(best_mcc_indices)
+        .collect()
 }

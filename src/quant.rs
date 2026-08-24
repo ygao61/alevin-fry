@@ -52,6 +52,7 @@ use crate::utils::KnownRecordType;
 use crate::utils as afutils;
 use crate::mlp_spline::{load_mlp_params_from_str, load_spline_lookup_table_from_str, NativeMlp};
 use crate::forseti::build_status_lookup;
+use crate::track::TrackStore;
 
 type BufferedGzFile = BufWriter<GzEncoder<fs::File>>;
 
@@ -1518,7 +1519,7 @@ pub fn do_quantify_forseti<T: BufRead, B >(
         // actually run.
         let use_forseti = matches!(resolution, ResolutionStrategy::ForsetiParsimonyEm);
 
-        let (mlp, spline_lookup, spliceu_txome, tx_status_lookup) = if use_forseti {
+        let (mlp, spline_lookup, spliceu_txome, tx_status_lookup, tracks) = if use_forseti {
             // ----------------------load mlp parameters---------------
             // The trained model and the fragment-length spline are shipped in
             // `resources/` and embedded at compile time, so a build carries
@@ -1567,16 +1568,22 @@ pub fn do_quantify_forseti<T: BufRead, B >(
             // build the tx status lookup table; this also enforces that the
             // t2g map is the 3-column (splicing status) flavor, which forseti
             // requires in order to tell spliced from unspliced candidates.
-            let tx_status_lookup: Vec<u8> = build_status_lookup(&quant_opts.tg_map, &hdr.ref_names)?;
+            let tx_status_lookup: Arc<Vec<u8>> =
+                Arc::new(build_status_lookup(&quant_opts.tg_map, &hdr.ref_names)?);
+            let mlp = Arc::new(mlp);
+            // Per-transcript hot-position affinity tracks (track.rs): built
+            // lazily, once per process, shared by every worker.
+            let tracks = TrackStore::new(hdr.ref_names.len(), tx_status_lookup.clone(), mlp.clone());
 
             (
-                Some(Arc::new(mlp)),
+                Some(mlp),
                 Some(Arc::new(spline_lookup)),
                 Some(Arc::new(spliceu_txome)),
-                Some(Arc::new(tx_status_lookup)),
+                Some(tx_status_lookup),
+                Some(Arc::new(tracks)),
             )
         } else {
-            (None, None, None, None)
+            (None, None, None, None, None)
         };
 
         // Share read-only resources across worker threads
@@ -1744,6 +1751,7 @@ pub fn do_quantify_forseti<T: BufRead, B >(
             let spliceu_txome = spliceu_txome.clone();
             let spline_lookup = spline_lookup.clone();
             let mlp = mlp.clone();
+            let tracks = tracks.clone();
             let tx_status_lookup = tx_status_lookup.clone();
             let max_frag_len = max_frag_len;
             
@@ -2032,7 +2040,7 @@ pub fn do_quantify_forseti<T: BufRead, B >(
                                                 .as_ref()
                                                 .expect("forseti resources must be loaded")
                                                 .as_ref(),
-                                            mlp.as_deref().expect("forseti MLP must be built"),
+                                            tracks.as_deref().expect("forseti tracks must be built"),
                                             tx_status_lookup
                                                 .as_ref()
                                                 .expect("forseti resources must be loaded")
@@ -2422,18 +2430,46 @@ pub fn do_quantify_forseti<T: BufRead, B >(
         );
 
         // Report the per-thread MLP affinity cache effectiveness (forseti scoring).
-        let (mlp_hits, mlp_misses) = crate::forseti::mlp_cache_stats();
-        let mlp_total = mlp_hits + mlp_misses;
-        if mlp_total > 0 {
+        let ts = crate::track::track_stats();
+        if ts.tx_touched > 0 {
             info!(
                 log,
-                "Forseti MLP cache: {} hits + {} misses = {} lookups; hit rate {:.1}% (MLP run on {} unique-ish 30-mers)",
-                mlp_hits.to_formatted_string(&Locale::en),
-                mlp_misses.to_formatted_string(&Locale::en),
-                mlp_total.to_formatted_string(&Locale::en),
-                100.0 * mlp_hits as f64 / mlp_total as f64,
-                mlp_misses.to_formatted_string(&Locale::en)
+                "Forseti tracks (U block {}): {} transcripts touched, {} blocks + {} tails built, {} fwd + {} rc hot positions ({:.1} MB), {} positions scanned, {} MLP evals, {:.1} CPU-s building; {} window queries used {} entries",
+                ts.u_block,
+                ts.tx_touched.to_formatted_string(&Locale::en),
+                ts.blocks_built.to_formatted_string(&Locale::en),
+                ts.tails_built.to_formatted_string(&Locale::en),
+                ts.fwd_entries.to_formatted_string(&Locale::en),
+                ts.rc_entries.to_formatted_string(&Locale::en),
+                ts.entry_bytes() as f64 / 1e6,
+                ts.positions_scanned.to_formatted_string(&Locale::en),
+                ts.mlp_evals.to_formatted_string(&Locale::en),
+                ts.build_secs,
+                ts.queries.to_formatted_string(&Locale::en),
+                ts.used_entries.to_formatted_string(&Locale::en)
             );
+            if let Some(tr) = tracks.as_ref() {
+                // per-block TSV only on request (FORSETI_TRACK_REPORT=<path>)
+                let tsv = std::env::var_os("FORSETI_TRACK_REPORT").map(std::path::PathBuf::from);
+                for line in tr.reuse_report(tsv.as_deref()) {
+                    info!(log, "{}", line);
+                }
+            }
+        }
+        // Shadow-mode report (only non-zero in `--features forseti-shadow` builds):
+        // every real candidate list was also scored by the frozen fix18 reference.
+        let (sh_lists, sh_cands, sh_mism) = crate::forseti::shadow_stats();
+        if sh_lists > 0 || sh_mism > 0 {
+            info!(
+                log,
+                "Forseti SHADOW check: {} candidate lists, {} candidates scored, {} MISMATCHING lists vs frozen reference",
+                sh_lists.to_formatted_string(&Locale::en),
+                sh_cands.to_formatted_string(&Locale::en),
+                sh_mism.to_formatted_string(&Locale::en)
+            );
+            if sh_mism > 0 {
+                warn!(log, "Forseti SHADOW check FAILED: production scoring differs from the frozen reference");
+            }
         }
 
         if dump_eq {

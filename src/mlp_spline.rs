@@ -147,6 +147,11 @@ impl NativeMlp {
         self.k
     }
 
+    #[inline]
+    pub fn hidden(&self) -> usize {
+        self.hidden
+    }
+
     /// Affinity of the k-mer `bytes[start..start+k]`, using `hbuf` (len = hidden)
     /// as scratch so the hot loop allocates nothing.
     #[inline]

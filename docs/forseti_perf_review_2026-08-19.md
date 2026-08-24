@@ -81,7 +81,21 @@ with `usa_offsets=None` → garbage indices. Fix: optional arg; `bail!` if
 
 ## 2. Speed
 
-### 2.1 HIGH — re-scoring the same transcript positions 122 × 10⁹ times
+### 2.1 HIGH — re-scoring the same transcript positions 122 × 10⁹ times — **done (fix19, 2026-08-24)**
+Implemented in `src/track.rs` (`TrackStore`): per-transcript hot-position tracks (spliced: whole transcript;
+unspliced: lazily built 1024-bp blocks, chosen from a 4096/1024/512 sweep), process-wide `OnceLock` slots,
+`f32` affinities, tail windows precomputed. The three scoring arms in `forseti.rs` are range scans over hot
+positions; control flow and summation order are unchanged. Equivalence is proven three ways: the frozen fix18
+copy in `src/forseti_reference.rs` + randomized bit-exact test (`cargo test --release`), the
+`--features forseti-shadow` build that re-scores every real candidate list with the reference (pbmc_1k:
+8.2 M lists / 221.7 M candidates; pbmc_10k: 82.6 M lists / 2.29 G candidates; 0 mismatches), and `collated_rad/compare.py` vs the fix18 reference quants
+(indistinguishable from a fix18 rerun). Measured on EPYC-7313, 32 threads, warm RAD:
+pbmc_10k forseti quant 16:13 → 6:39 (2.4×), RSS 44.7 → 47.9 GB (+7%); pbmc_1k 1:50 → 1:12.
+Track building is ~1000 CPU-s (30 s wall) and the per-thread MLP cache (3.2) is gone. Reuse analysis (per-block
+query counts, `FORSETI_TRACK_REPORT=<tsv>`): S tracks < 200 MB with 95–99.6 % of queries on blocks queried ≥100×;
+U blocks carry all the memory, and blocks queried ≥10× serve ~99 % of queries; the 1–2× tier is ≤ 1.7 GB
+(3.6 % of RSS) so no eviction policy was added. Original analysis follows.
+
 Binding affinity is a property of a *transcript position*, yet it is recomputed (via a per-thread 30-mer
 hash cache) for every (MCC, transcript) candidate in every cell: `pack_kmer` (30-iteration loop) +
 SipHash lookup per hot 30-mer (`forseti.rs:239-288`), and the log-sum loops run over **all** `n_kmers`
@@ -168,7 +182,7 @@ any worker starts. Options, from smallest change to best:
   (gene, offset) would cut the unspliced part several-fold (needs a roers change).
 Also: only load when `resolution == ForsetiParsimonyEm` (currently unconditional on the RnaShortPos path).
 
-### 3.2 HIGH — per-thread, unbounded MLP cache ≈ 7–9 GB
+### 3.2 HIGH — per-thread, unbounded MLP cache ≈ 7–9 GB — **removed by fix19 (replaced by the track store, see 2.1)**
 `forseti.rs:229-234`: `thread_local! HashMap<u64, f64>`; 429 M misses total → 429 M entries across 31
 threads × ~20 B (key + f64 + hashbrown overhead) ≈ 8.6 GB, and the same 30-mer is recomputed once per
 thread. This is most of the 42 − 35 = 7 GB delta over baseline quant. Fix: process-global shared cache
@@ -217,7 +231,7 @@ data-proportional and shared.
 2. `tch::set_num_threads(1)` + `ahash` cache + f32 values + `Vec` instead of `HashMap` for
    `forseti_checking_list` — one afternoon, measurable.
 3. Native MLP (drop libtorch) + `include_str!` params.
-4. Per-transcript hot-position tracks + hot-only scoring (2.1) — the real speed fix; this also replaces 3.2.
+4. ~~Per-transcript hot-position tracks + hot-only scoring (2.1)~~ **done (fix19)**; replaced 3.2.
 5. spliceu storage (3.1): 2-bit pack or mmap+fai; load only for Forseti.
 6. libradicl record / collate allocation work (2.6, 3.3) — benefits all modes.
 7. Profile baseline quant memory (3.6).

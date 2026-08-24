@@ -42,7 +42,7 @@ use ndarray::Array1;
 use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
-use tch::nn;
+use crate::mlp_spline::NativeMlp;
 
 #[derive(Debug)]
 pub enum PugEdgeType {
@@ -1406,7 +1406,7 @@ pub fn get_num_molecules_forseti(
     ref_names: &[String],
     spliceu_txome: &HashMap<u32, Vec<u8>>,
     spline_lookup: &Array1<f64>,
-    mlp: &nn::Sequential,
+    mlp: &NativeMlp,
     tx_status_lookup: &Vec<u8>,
     log: &slog::Logger,
 ) -> PugResolutionStatistics{

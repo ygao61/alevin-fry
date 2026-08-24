@@ -1,10 +1,6 @@
 use anyhow::{Context, Result};
 use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
-// use std::error::Error;
-use tch::nn::ModuleT;
-use tch::no_grad;
-use tch::{nn, Device,Kind, Tensor};
 use serde_json::Value;
 
 #[derive(Deserialize, Serialize)]
@@ -67,100 +63,147 @@ pub fn load_mlp_params_from_str(json: &str) -> Result<MLPParamsND> {
     params.to_ndarray()
 }
 
-pub fn create_mlp_with_tch(params: &MLPParamsND) -> Result<nn::Sequential> {
-    let vs = nn::VarStore::new(Device::Cpu);
-    let mut net = nn::seq();
+/// Nucleotide -> one-hot column within a position block (A,C,G,T,N). Anything
+/// else (lower case, IUPAC codes) is treated as N, matching the training encoding.
+#[inline]
+pub fn base_code(b: u8) -> usize {
+    match b {
+        b'A' => 0,
+        b'C' => 1,
+        b'G' => 2,
+        b'T' => 3,
+        _ => 4,
+    }
+}
 
-    // Adjusted to reflect the transposed weights
-    for (i, (weights, biases)) in params.weights.iter().zip(&params.biases).enumerate() {
-        let output_size = weights.shape()[0]; // After transpose
-        let input_size = weights.shape()[1];
+/// The Forseti binding-affinity MLP evaluated natively: one-hot(k-mer, 5 symbols)
+/// -> hidden (ReLU) -> 1 (sigmoid).
+///
+/// The input is one-hot, so the first layer is not a matrix-vector product: for
+/// each of the k positions exactly one input is 1, and `W1 . x` is the sum of k
+/// columns of `W1`. We store `W1` column-major (`w1[input][hidden]`) so each
+/// position contributes one contiguous `hidden`-length add. That is ~k*hidden
+/// adds per k-mer (3,000 for k=30, hidden=100) instead of the 15,000 multiply-adds
+/// a dense matmul performs, and it needs no tensor library: this replaced the
+/// libtorch (`tch`) backend, which cost ~10-50 us of dispatch per call around a
+/// ~5 us computation and spawned an OpenMP pool per worker thread.
+///
+/// Arithmetic is f32 like the libtorch path was (weights were loaded with
+/// `Kind::Float`), so outputs agree with it to summation-order rounding (~1e-7).
+pub struct NativeMlp {
+    k: usize,
+    hidden: usize,
+    /// `w1[(j*5 + code) * hidden + h]`
+    w1: Vec<f32>,
+    b1: Vec<f32>,
+    w2: Vec<f32>,
+    b2: f32,
+}
 
-        let mut layer = nn::linear(
-            &vs.root(),
-            input_size as i64,  // in_features
-            output_size as i64, // out_features
-            Default::default(),
+impl NativeMlp {
+    pub fn from_params(params: &MLPParamsND) -> Result<Self> {
+        anyhow::ensure!(
+            params.weights.len() == 2 && params.biases.len() == 2,
+            "NativeMlp expects exactly two layers, got {}",
+            params.weights.len()
         );
-
-        no_grad(|| {
-            // No need to transpose if weights are already transposed in Python
-            layer.ws.copy_(
-                &Tensor::from_slice(weights.as_slice().unwrap())
-                    .reshape([output_size as i64, input_size as i64])
-                    .to_kind(Kind::Float),
-            );
-
-            // Copy biases
-            if let Some(ref mut bias) = layer.bs {
-                bias.copy_(&Tensor::from_slice(biases.as_slice().unwrap()).to_kind(Kind::Float));
-            }
-        });
-
-        net = net.add(layer);
-
-        // Activation function
-        if i < params.weights.len() - 1 {
-            if params.activation.to_lowercase() == "relu" {
-                net = net.add_fn(|x| x.relu());
-            } else {
-                return Err(anyhow::anyhow!(
-                    "Unsupported activation: {}",
-                    params.activation
-                ));
+        anyhow::ensure!(
+            params.activation.eq_ignore_ascii_case("relu")
+                && params.output_activation.eq_ignore_ascii_case("logistic"),
+            "NativeMlp expects relu + logistic, got {} + {}",
+            params.activation,
+            params.output_activation
+        );
+        let w1_t = &params.weights[0]; // (hidden, inputs) -- already transposed in JSON
+        let w2_t = &params.weights[1]; // (1, hidden)
+        let (hidden, inputs) = (w1_t.shape()[0], w1_t.shape()[1]);
+        anyhow::ensure!(inputs % 5 == 0, "input width {} is not a multiple of 5", inputs);
+        anyhow::ensure!(
+            w2_t.shape() == [1, hidden] && params.biases[0].len() == hidden && params.biases[1].len() == 1,
+            "MLP shape mismatch: W1 {:?}, W2 {:?}, b1 {}, b2 {}",
+            w1_t.shape(),
+            w2_t.shape(),
+            params.biases[0].len(),
+            params.biases[1].len()
+        );
+        let mut w1 = vec![0f32; inputs * hidden];
+        for h in 0..hidden {
+            for i in 0..inputs {
+                w1[i * hidden + h] = w1_t[(h, i)] as f32;
             }
         }
+        Ok(NativeMlp {
+            k: inputs / 5,
+            hidden,
+            w1,
+            b1: params.biases[0].iter().map(|&v| v as f32).collect(),
+            w2: w2_t.iter().map(|&v| v as f32).collect(),
+            b2: params.biases[1][0] as f32,
+        })
     }
 
-    // Output activation
-    if params.output_activation.to_lowercase() == "logistic" {
-        net = net.add_fn(|x| x.sigmoid()); // Use PyTorch's sigmoid
-    } else {
-        return Err(anyhow::anyhow!(
-            "Unsupported output activation: {}",
-            params.output_activation
-        ));
+    #[inline]
+    pub fn k(&self) -> usize {
+        self.k
     }
 
-    Ok(net)
+    /// Affinity of the k-mer `bytes[start..start+k]`, using `hbuf` (len = hidden)
+    /// as scratch so the hot loop allocates nothing.
+    #[inline]
+    pub fn predict_at(&self, bytes: &[u8], start: usize, hbuf: &mut [f32]) -> f64 {
+        debug_assert_eq!(hbuf.len(), self.hidden);
+        hbuf.copy_from_slice(&self.b1);
+        for j in 0..self.k {
+            let col = (j * 5 + base_code(bytes[start + j])) * self.hidden;
+            let w = &self.w1[col..col + self.hidden];
+            for (acc, &wv) in hbuf.iter_mut().zip(w) {
+                *acc += wv;
+            }
+        }
+        let mut z = self.b2;
+        for (&hv, &wv) in hbuf.iter().zip(&self.w2) {
+            if hv > 0.0 {
+                z += hv * wv;
+            }
+        }
+        (1.0 / (1.0 + (-z).exp())) as f64
+    }
+
+    /// Affinities for the k-mers starting at `starts`; replaces the batched
+    /// libtorch forward.
+    pub fn predict_starts(&self, bytes: &[u8], starts: &[usize]) -> Array1<f64> {
+        let mut hbuf = vec![0f32; self.hidden];
+        Array1::from_iter(starts.iter().map(|&s| self.predict_at(bytes, s, &mut hbuf)))
+    }
 }
 
-pub fn predict_with_tch(net: &nn::Sequential, input: Array2<f32>) -> Result<Array1<f64>> {
-    let input_tensor = Tensor::from_slice(input.as_slice().unwrap())
-        .reshape([input.shape()[0] as i64, input.shape()[1] as i64]);
-    // Perform prediction
-    let output_tensor = net.forward_t(&input_tensor, false);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    // Convert Tensor back to a 1D array of f64 (positive class scores)
-    let output_vec: Vec<f64> = output_tensor
-        .view(-1) // Flatten the tensor to 1D
-        .shallow_clone() // Clone the tensor
-        .try_into()
-        .expect("Failed to convert Tensor to Vec<f64>");
+    /// Reference values produced by PyTorch (f32) from the same JSON, via
+    /// scripts/gen_mlp_reference.py. Each line: <30-mer>\t<sigmoid output>.
+    const REFERENCE: &str = include_str!("../resources/mlp_reference_kmers.tsv");
+    const PARAMS: &str = include_str!("../resources/mlp_params_Transpose.json");
 
-    let output_array = Array1::from_vec(output_vec); // Create 1D Array1
-
-    Ok(output_array)
+    #[test]
+    fn native_mlp_matches_pytorch_reference() {
+        let mlp = NativeMlp::from_params(&load_mlp_params_from_str(PARAMS).unwrap()).unwrap();
+        let mut hbuf = vec![0f32; mlp.hidden];
+        let mut n = 0usize;
+        let mut max_abs = 0f64;
+        for line in REFERENCE.lines().filter(|l| !l.is_empty()) {
+            let (kmer, val) = line.split_once('\t').unwrap();
+            let expected: f64 = val.parse().unwrap();
+            let got = mlp.predict_at(kmer.as_bytes(), 0, &mut hbuf);
+            max_abs = max_abs.max((got - expected).abs());
+            n += 1;
+        }
+        eprintln!("native vs pytorch: {} k-mers, max |diff| = {:e}", n, max_abs);
+        assert!(n >= 1000, "reference set too small: {}", n);
+        assert!(max_abs < 1e-5, "max |native - torch| = {:e} over {} k-mers", max_abs, n);
+    }
 }
-// fn main() -> Result<()> {
-//     // Load MLP parameters from JSON
-//     let params = load_mlp_params("/fs/nexus-projects/sc_frag_len/nextflow/umi_level/my_clean_custom_alevin_fry/speed_up_PUG_forseti/convert_to_rust/mlp_params.json")?;
-
-//     // Create MLP model using Tch
-//     let mlp = create_mlp_with_tch(&params)?;
-
-//     // Prepare input (one-hot encoded data with 150 columns)
-//     let random_array: Array2<f32> = Array2::random((50, 150), Uniform::new(0.0, 1.0));
-
-//     // Predict
-//     let predictions = predict_with_tch(&mlp, random_array)?;
-
-//     // Print predictions
-//     println!("Predictions: {:?}", predictions);
-
-//     Ok(())
-// }
-
 
 /// Same as [`load_spline_lookup_table`], but reads the JSON from memory
 /// (see [`load_mlp_params_from_str`]).

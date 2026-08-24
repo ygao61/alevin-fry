@@ -1,4 +1,4 @@
-use crate::mlp_spline::predict_with_tch;
+use crate::mlp_spline::NativeMlp;
 use anyhow::{Context, Result, bail};
 use ndarray::prelude::*;
 use ndarray::{Array1, Array2};
@@ -7,7 +7,6 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use tch::nn;
 type CoveringTxpId = u32;
 /// RAD alignment tuple: (is_reverse, ref_start)
 type AlgnTuple = (bool, u32);
@@ -189,28 +188,6 @@ fn compute_has_6a(bytes: &[u8], k: usize, min_run: usize) -> Array1<bool> {
     Array1::from(hot)
 }
 
-/// One-hot encode the k-mers starting at `indices`, reading directly from `bytes`
-/// (no per-k-mer String allocation). Same A,C,G,T,N -> 0..4 column layout as the
-/// previous `one_hot_encoder`.
-fn one_hot_from_bytes(bytes: &[u8], k: usize, indices: &[usize]) -> Array2<f32> {
-    let num_classes = 5usize; // A, C, G, T, N
-    let mut code_to_idx = [-1i32; 256];
-    for (i, &nuc) in [b'A', b'C', b'G', b'T', b'N'].iter().enumerate() {
-        code_to_idx[nuc as usize] = i as i32;
-    }
-    if indices.is_empty() {
-        return Array2::<f32>::zeros((0, 0));
-    }
-    let mut one_hot = Array2::<f32>::zeros((indices.len(), k * num_classes));
-    for (row, &start) in indices.iter().enumerate() {
-        for j in 0..k {
-            let idx = code_to_idx[bytes[start + j] as usize] as usize;
-            one_hot[(row, j * num_classes + idx)] = 1.0;
-        }
-    }
-    one_hot
-}
-
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -257,7 +234,7 @@ fn process_binding_affinity(
     bytes: &[u8],
     k: usize,
     has_enough_a: &Array1<bool>,
-    mlp: &nn::Sequential,
+    mlp: &NativeMlp,
     discount_perc: f64,
     binding_affinity_threshold: f64,
 ) -> Result<Array1<f64>> {
@@ -291,8 +268,8 @@ fn process_binding_affinity(
 
     // 2) one batched MLP forward on the MISSES only, then post-process + cache
     if !miss_start.is_empty() {
-        let encoded = one_hot_from_bytes(bytes, k, &miss_start);
-        let mut nonzero = predict_with_tch(&mlp, encoded)?;
+        debug_assert_eq!(k, mlp.k());
+        let mut nonzero = mlp.predict_starts(bytes, &miss_start);
         if nonzero.len() != miss_start.len() {
             return Err(anyhow::anyhow!(
                 "Mismatched dimensions between binding affinity and has_enough_a"
@@ -378,7 +355,7 @@ pub fn forseti_for_multi_best(
     ref_names: &[String],
     spliceu_txome: &HashMap<u32, Vec<u8>>,
     spline_lookup: &Array1<f64>,
-    mlp: &nn::Sequential,
+    mlp: &NativeMlp,
     read_length: u16,
     max_frag_len: u16,
 ) -> Result<Vec<u16>> {

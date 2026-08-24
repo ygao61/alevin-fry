@@ -30,7 +30,6 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use ndarray::Array1;
-use tch::nn;
 
 use libradicl::rad_types::TagMap;
 use libradicl::record::{AlevinFryReadRecord, AlevinFryReadRecordWithPosition, ConvertiblePrimitiveInteger, 
@@ -51,7 +50,7 @@ use crate::prog_opts::QuantOpts;
 use crate::pugutils;
 use crate::utils::KnownRecordType;
 use crate::utils as afutils;
-use crate::mlp_spline::{create_mlp_with_tch, load_mlp_params_from_str, load_spline_lookup_table_from_str};
+use crate::mlp_spline::{load_mlp_params_from_str, load_spline_lookup_table_from_str, NativeMlp};
 use crate::forseti::build_status_lookup;
 
 type BufferedGzFile = BufWriter<GzEncoder<fs::File>>;
@@ -1519,13 +1518,14 @@ pub fn do_quantify_forseti<T: BufRead, B >(
         // actually run.
         let use_forseti = matches!(resolution, ResolutionStrategy::ForsetiParsimonyEm);
 
-        let (mlp_params, spline_lookup, spliceu_txome, tx_status_lookup) = if use_forseti {
+        let (mlp, spline_lookup, spliceu_txome, tx_status_lookup) = if use_forseti {
             // ----------------------load mlp parameters---------------
             // The trained model and the fragment-length spline are shipped in
             // `resources/` and embedded at compile time, so a build carries
             // them with it and needs no external data files at run time.
-            let mlp_params = load_mlp_params_from_str(MLP_PARAMS_JSON)?;
-            // We'll create mlp for each threads, as VarStore and nn::Sequential is not Sync or Send, we can't safely share them between threads.
+            // Evaluated natively (see mlp_spline::NativeMlp); plain data, shared by
+            // every worker thread through an Arc.
+            let mlp = NativeMlp::from_params(&load_mlp_params_from_str(MLP_PARAMS_JSON)?)?;
 
             // -------------------load spline model---------------
             let spline_lookup = load_spline_lookup_table_from_str(SPLINE_TABLE_JSON)?;
@@ -1570,7 +1570,7 @@ pub fn do_quantify_forseti<T: BufRead, B >(
             let tx_status_lookup: Vec<u8> = build_status_lookup(&quant_opts.tg_map, &hdr.ref_names)?;
 
             (
-                Some(Arc::new(mlp_params)),
+                Some(Arc::new(mlp)),
                 Some(Arc::new(spline_lookup)),
                 Some(Arc::new(spliceu_txome)),
                 Some(Arc::new(tx_status_lookup)),
@@ -1743,7 +1743,7 @@ pub fn do_quantify_forseti<T: BufRead, B >(
             let ref_names = ref_names.clone();
             let spliceu_txome = spliceu_txome.clone();
             let spline_lookup = spline_lookup.clone();
-            let mlp_params = mlp_params.clone();
+            let mlp = mlp.clone();
             let tx_status_lookup = tx_status_lookup.clone();
             let max_frag_len = max_frag_len;
             
@@ -1772,11 +1772,6 @@ pub fn do_quantify_forseti<T: BufRead, B >(
             };    
             // now, make the worker thread
             let handle = std::thread::spawn(move || {
-                // Create Forseti MLP once per worker thread (nn::Sequential is not Sync/Send);
-                // only the forseti resolution has any use for it.
-                let mlp = mlp_params.as_ref().map(|p| {
-                    create_mlp_with_tch(p.as_ref()).expect("failed to create MLP model for Forseti")
-                });
                 // these can be created once and cleared after processing
                 // each cell.
                 let mut unique_evidence = vec![false; num_rows];
@@ -2037,7 +2032,7 @@ pub fn do_quantify_forseti<T: BufRead, B >(
                                                 .as_ref()
                                                 .expect("forseti resources must be loaded")
                                                 .as_ref(),
-                                            mlp.as_ref().expect("forseti MLP must be built"),
+                                            mlp.as_deref().expect("forseti MLP must be built"),
                                             tx_status_lookup
                                                 .as_ref()
                                                 .expect("forseti resources must be loaded")

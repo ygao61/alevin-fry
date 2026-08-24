@@ -1,41 +1,24 @@
-//! Per-transcript "hot-position" affinity tracks for the Forseti resolver
-//! (fix19, perf-review item 2.1).
+//! Per-transcript binding-affinity tracks for the Forseti resolver.
 //!
-//! Forseti scores a candidate (MCC, transcript) by sliding a 30-mer window
-//! over a stretch of the transcript and summing, over the candidate's
-//! alignments, `ln(aff(p) * spline[p - ref_start] + EPS)` for every window
-//! start `p`, then taking the maximum over `p`. The binding affinity `aff(p)`
-//! is a property of the transcript position alone (strand, 30-mer): it does
-//! not depend on the cell, the MCC, or the alignments. The fix18 code
-//! nevertheless re-derived it for every candidate in every cell (6A scan +
-//! 30-mer packing + a per-thread hash cache + MLP on misses), ~10^11 lookups
-//! per sample, and ran the log-sum over *all* window positions although a
-//! position with no 6A run contributes the constant `ln(EPS)`.
+//! The affinity of a 30-mer depends only on (transcript, strand, position), so
+//! it is computed once per process and shared by all workers, keeping only the
+//! "hot" positions (30-mers with a run of >= 6 A; every other position has
+//! affinity 0). Scoring a candidate window is a range scan over its hot
+//! positions.
 //!
-//! This module computes `aff(p)` once per (transcript, strand, position),
-//! process-wide, and keeps only the "hot" positions (those whose 30-mer
-//! contains a run of >= 6 A, i.e. the only positions with a non-zero
-//! affinity). Scoring becomes a range scan over the hot positions inside the
-//! candidate window.
+//! Exactness: each scored term is `ln(aff * frag + EPS) >= ln(EPS)` (both
+//! factors are >= 0; the spline table is clamped at load) and a cold position
+//! contributes exactly `ln(EPS)`, so the maximum over hot positions equals the
+//! maximum over all positions whenever a hot position exists -- the condition
+//! under which the per-window scorer produced a score at all. Affinities are
+//! stored as `f32`, lossless for the MLP's `f32` sigmoid output. The frozen
+//! per-window scorer (`forseti_reference.rs`) and the `forseti-shadow` feature
+//! check this bit-for-bit.
 //!
-//! Why this is exactly equivalent (not an approximation): every term is
-//! `ln(aff * frag + EPS) >= ln(EPS)` because `aff >= 0` and the spline table
-//! is clamped to `>= 0` at load time, so a cold position (aff = 0, every term
-//! exactly `ln(EPS)`) can never exceed a hot one, and the maximum over all
-//! positions equals the maximum over the hot ones whenever any hot position
-//! exists -- which is precisely the condition under which fix18 scored the
-//! window at all. The per-position summation order over alignments is kept,
-//! and affinities are stored as `f32` (the MLP output is an `f32` sigmoid
-//! widened to `f64`, so this is lossless), which makes the scores
-//! bit-identical to `forseti_reference`.
-//!
-//! Storage granularity (decided with the PI, 2026-08-24): spliced
-//! transcripts get one track for their whole length; unspliced transcripts
-//! (tens of kb, reads touching only small parts) are split into
-//! [`UNSPLICED_BLOCK`]-bp (1024, chosen from a 4096/1024/512 sweep on pbmc_1k/10k:
-//! equal speed and memory to 512, ~7% RSS over fix18 for 2.4x speed) blocks
-//! that are built lazily as candidate windows
-//! touch them. Both are lazy at the transcript level: a transcript that is
+//! Storage: spliced transcripts get one whole-length track; unspliced ones are
+//! split into [`UNSPLICED_BLOCK`]-bp blocks built on first use (1024 bp was the
+//! fastest of 4096/1024/512 at equal memory on pbmc_1k/10k; see
+//! docs/forseti_perf_review_2026-08-19.md, item 2.1). A transcript that is
 //! never a candidate costs one empty slot.
 
 use crate::forseti::compute_has_6a;
@@ -71,8 +54,7 @@ fn unspliced_block() -> usize {
 /// Splicing-status byte (from the 3-column t2g) that selects blocked storage.
 pub const UNSPLICED_STATUS: u8 = b'U';
 
-// The affinity post-processing constants of `forseti_for_multi_best`. Kept
-// here so the track builder and the scorer cannot drift apart.
+// Affinity post-processing constants, kept next to the builder that applies them.
 /// Multiplicative discount applied to the raw MLP output.
 pub const DISCOUNT_PERC: f64 = 1.0;
 /// Raw affinities at or below this are set to 0.
@@ -139,9 +121,9 @@ pub fn track_stats() -> TrackStats {
 
 // ------------------------------------------------------------ affinity ---
 
-/// fix18 post-processing of one raw MLP output for the 30-mer `window`:
-/// an all-`A` window is 1.0; otherwise the discounted value, floored to 0 at
-/// the threshold. Stored as `f32`, which is lossless for these values.
+/// Post-processing of one raw MLP output for the 30-mer `window`: all-`A`
+/// -> 1.0; otherwise the discounted value, floored to 0 at the threshold.
+/// `f32` is lossless for these values.
 #[inline]
 pub fn finalize_affinity(window: &[u8], raw: f64) -> f32 {
     let nonzero = raw * DISCOUNT_PERC;
@@ -155,9 +137,8 @@ pub fn finalize_affinity(window: &[u8], raw: f64) -> f32 {
     aff as f32
 }
 
-/// Reverse-complement `src` into `dst` (cleared first). Same alphabet
-/// handling as the fix18 `reverse_complement`: `N`/`n` -> `N`, lower case is
-/// upper-cased; anything else is a reference-format error.
+/// Reverse-complement `src` into `dst` (cleared first): `N`/`n` -> `N`,
+/// lower case is upper-cased, anything else is a reference-format error.
 fn reverse_complement_into(src: &[u8], dst: &mut Vec<u8>) {
     dst.clear();
     dst.reserve(src.len());

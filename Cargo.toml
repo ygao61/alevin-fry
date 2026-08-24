@@ -129,6 +129,6 @@ aarch64-apple-darwin = "macos-14"
 
 [features]
 # Score every real candidate list with both the production path and the frozen
-# fix18 reference (src/forseti_reference.rs) and count bit-level mismatches.
+# per-window scorer (src/forseti_reference.rs) and count bit-level mismatches.
 # Test/validation builds only: `cargo build --release --features forseti-shadow`.
 forseti-shadow = []

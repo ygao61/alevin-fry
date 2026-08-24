@@ -2457,7 +2457,7 @@ pub fn do_quantify_forseti<T: BufRead, B >(
             }
         }
         // Shadow-mode report (only non-zero in `--features forseti-shadow` builds):
-        // every real candidate list was also scored by the frozen fix18 reference.
+        // every real candidate list was also scored by the frozen reference scorer.
         let (sh_lists, sh_cands, sh_mism) = crate::forseti::shadow_stats();
         if sh_lists > 0 || sh_mism > 0 {
             info!(

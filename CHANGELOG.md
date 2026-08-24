@@ -2,6 +2,27 @@
 
 Changelog for alevin-fry
 
+## Unreleased (forseti branch)
+
+### Performance
+
+* **forseti: per-transcript binding-affinity tracks** (tag `forseti-fix19`, 0a3c8a1). Affinity is computed
+  once per (transcript, strand, position) in a process-wide store (`src/track.rs`; spliced transcripts whole,
+  unspliced in 1024-bp blocks built on first use) and each candidate window is scored over its hot positions
+  only. Scores are bit-identical to the previous per-window scorer (frozen in `src/forseti_reference.rs`;
+  randomized test + `--features forseti-shadow` on 2.5 G real candidates, 0 mismatches). pbmc_10k forseti
+  quant 16:13 -> 6:38 on 32 threads, peak RSS +6 %. Removes the per-thread MLP cache.
+* **forseti: native MLP, libtorch dropped** (tag `forseti-fix18`, 3af81cf). The 150->100->1 model is evaluated
+  in plain Rust (`NativeMlp`), shared by all workers; no `LIBTORCH`/`LD_LIBRARY_PATH` or OMP thread pinning
+  needed. Output matches PyTorch to < 1e-5 (unit test against `resources/mlp_reference_kmers.tsv`).
+
+### Bug fixes
+
+* forseti: deterministic candidate order and cross-MCC tie-break (c0d45fb); collate bucket buffer size for
+  position records, `--max-frag-len` validated against the spline table (df228d1); UMI-index alignment
+  between the PUG and the forseti eq-class view, small-cell arm, `--spliceu-fa` only required for
+  forseti (a19b8ca).
+
 ## [0.9.0](https://github.com/COMBINE-lab/alevin-fry/compare/v0.8.2...v0.9.0) (2024-03-08)
 
 

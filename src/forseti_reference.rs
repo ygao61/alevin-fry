@@ -1,17 +1,15 @@
 //! Frozen reference implementation of the Forseti candidate scoring.
 //!
-//! This is a verbatim copy of `forseti::forseti_score_candidates` as of
-//! fix18 (commit 3af81cf): the per-window 6A scan + MLP + log-sum over *every*
-//! 30-mer position of the window. It is compiled only for tests and exists so
-//! that any later rewrite of the scoring (per-transcript hot-position tracks,
-//! etc.) can be checked bit-for-bit against the original semantics. Do not
-//! "improve" this file; if the semantics are meant to change, that is a new
-//! fix with its own before/after comparison, and this file gets re-frozen.
+//! Verbatim copy of `forseti::forseti_score_candidates` as of commit 3af81cf:
+//! per window, a 6A scan + MLP + log-sum over every 30-mer position. Compiled
+//! only for tests and `--features forseti-shadow`, so any rewrite of the
+//! scoring can be checked bit-for-bit against the original semantics. Do not
+//! "improve" this file: a deliberate change of semantics is its own commit
+//! with a before/after comparison, after which this copy is re-frozen.
 //!
-//! The only deliberate difference from the fix18 code is that the per-thread
-//! MLP affinity cache is gone: every hot 30-mer is evaluated directly. The
-//! cache never changed a value (it stored the final affinity), so this is
-//! numerically identical.
+//! The only difference from 3af81cf is that the per-thread MLP affinity cache
+//! is gone and every hot 30-mer is evaluated directly; the cache stored final
+//! affinities, so values are identical.
 
 #![allow(dead_code)]
 
@@ -70,9 +68,8 @@ fn compute_has_6a(bytes: &[u8], k: usize, min_run: usize) -> Array1<bool> {
     Array1::from(hot)
 }
 
-/// Cache-free copy of fix18 `process_binding_affinity`: identical
-/// post-processing (all-A -> 1.0, `<= threshold` -> 0.0, else the discounted
-/// MLP output).
+/// Cache-free copy of `process_binding_affinity` (commit 3af81cf): all-A ->
+/// 1.0, `<= threshold` -> 0.0, else the discounted MLP output.
 fn reference_binding_affinity(
     bytes: &[u8],
     k: usize,

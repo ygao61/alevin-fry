@@ -119,9 +119,10 @@ pub fn shadow_stats() -> (u64, u64, u64) {
     )
 }
 
-/// Shadow mode: re-score the same real candidate list with the frozen fix18
-/// reference and compare every score bit-for-bit. Mismatches are counted and
-/// the first few are printed with enough context to replay them.
+/// Shadow mode: re-score the same candidate list with the frozen per-window
+/// scorer (`forseti_reference`) and compare every score bit-for-bit.
+/// Mismatches are counted; the first few are printed with enough context to
+/// replay them.
 #[cfg(feature = "forseti-shadow")]
 fn shadow_check(
     forseti_checking_list: &ForsetiCheckingList,
@@ -209,12 +210,11 @@ pub fn forseti_for_multi_best(
 /// window is recorded with `f64::NEG_INFINITY`, candidates skipped by an
 /// early `continue` are not recorded at all.
 ///
-/// fix19: the binding affinities come from the per-transcript hot-position
-/// tracks (`track.rs`) and each window is scored as a scan over its hot
-/// positions only. See the `track` module docs for why this is exactly the
-/// fix18 result; `forseti_reference` holds the fix18 code and the test
-/// `production_scoring_matches_frozen_reference` (plus the
-/// `forseti-shadow` build feature on real data) checks bit-equality.
+/// Affinities come from the per-transcript tracks (`track.rs`) and each
+/// window is scored over its hot positions only; the `track` module docs
+/// explain why this equals the per-window result. `forseti_reference` keeps
+/// the per-window scorer; `production_scoring_matches_frozen_reference` and
+/// the `forseti-shadow` feature check bit-equality.
 pub(crate) fn forseti_score_candidates(
     forseti_checking_list: &ForsetiCheckingList,
     ref_names: &[String],
@@ -302,7 +302,7 @@ pub(crate) fn forseti_score_candidates(
             if tx_ref_end - overlap_wdow_start > 30 {
                 let e = usize::min(overlap_wdow_end + 30, tx_ref_end);
                 if e - (overlap_wdow_start + 1) < 30 {
-                    // fewer than one 30-mer in the window (fix18: has_enough_a empty)
+                    // fewer than one 30-mer in the window
                     continue;
                 }
                 tracks.fwd_hot(tid, ref_seq, overlap_wdow_start + 1, e - 30, &mut hot);
@@ -330,8 +330,8 @@ pub(crate) fn forseti_score_candidates(
             // Tail arm: the window runs past the last 30-mer of the reference, so
             // borrow A's from the poly-A tail (virtual 30-mers = last 29-j bases +
             // j+1 A's, at most 15; beyond that a window counts as pure poly-A).
-            // `tx_ref_end >= 30` mirrors fix18's `we > tx_end - 30` in release
-            // arithmetic (a shorter reference wrapped and never took this arm).
+            // `tx_ref_end >= 30` mirrors the original unsigned `we > tx_end - 30`
+            // (a reference shorter than 30 wrapped and never took this arm).
             if tx_ref_end >= 30 && overlap_wdow_end > tx_ref_end - 30 {
                 let needed_extra_a_len = 30 + overlap_wdow_end - tx_ref_end;
                 let n_tail = needed_extra_a_len.min(15);

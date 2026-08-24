@@ -7,9 +7,11 @@
 //! "improve" this file: a deliberate change of semantics is its own commit
 //! with a before/after comparison, after which this copy is re-frozen.
 //!
-//! The only difference from 3af81cf is that the per-thread MLP affinity cache
-//! is gone and every hot 30-mer is evaluated directly; the cache stored final
-//! affinities, so values are identical.
+//! Two deliberate differences from 3af81cf, neither changing a value: the
+//! per-thread MLP affinity cache is gone (it stored final affinities, so every
+//! hot 30-mer is simply evaluated directly), and the tail-arm test uses
+//! `tx_ref_end.wrapping_sub(30)` so that the release-build behaviour (the arm
+//! is skipped for references shorter than 30) also holds under overflow checks.
 
 #![allow(dead_code)]
 
@@ -255,7 +257,10 @@ pub(crate) fn reference_score_candidates(
             }
             // the downstream window end is beyond the last 30 mer of the ref, we could borrow A from the poly A tail.
             // And, we only compute the case that we consider borrowed A from tail(avoid duplicate computation for cases above, pure internal polyA)
-            if overlap_wdow_end > tx_ref_end - 30 {
+            // The shipped scorer was only ever run in release builds, where this
+            // subtraction wraps for transcripts shorter than 30 bp and the arm is
+            // skipped; wrapping_sub keeps that behaviour under overflow checks too.
+            if overlap_wdow_end > tx_ref_end.wrapping_sub(30) {
                 let needed_extra_a_len = 30 + overlap_wdow_end - tx_ref_end;
                 // Build tail 30-mers with extra added "A"s from polyA tail
                 // at most we add 15 extra A, since when 30mer has >15A, we will consider this as polyA tail. no need to add more& we can be efficient.
@@ -443,6 +448,7 @@ mod tests {
     use super::reference_score_candidates;
     use crate::forseti::{forseti_score_candidates, select_best_mcc_indices, ForsetiCheckingList};
     use crate::mlp_spline::{load_mlp_params_from_str, load_spline_lookup_table_from_str, NativeMlp};
+    use crate::seqstore::MemSeqStore;
     use crate::track::TrackStore;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -610,13 +616,13 @@ mod tests {
         let mut n_finite = 0usize;
         let mut n_winners = 0usize;
         let (mut txome, mut names) = gen_txome(&mut rng);
-        let mut tracks = TrackStore::new(txome.len(), Arc::new(gen_status(&mut rng, txome.len())), mlp.clone());
+        let mut tracks = TrackStore::new(txome.len(), Arc::new(gen_status(&mut rng, txome.len())), mlp.clone(), Arc::new(MemSeqStore(txome.clone())));
         for it in 0..iters {
             if it % 40 == 0 {
                 let t = gen_txome(&mut rng);
                 txome = t.0;
                 names = t.1;
-                tracks = TrackStore::new(txome.len(), Arc::new(gen_status(&mut rng, txome.len())), mlp.clone());
+                tracks = TrackStore::new(txome.len(), Arc::new(gen_status(&mut rng, txome.len())), mlp.clone(), Arc::new(MemSeqStore(txome.clone())));
             }
             let read_length: u16 = if rng.chance(80) { 91 } else { 150 };
             let max_frag_len: u16 = match rng.below(3) {
@@ -627,7 +633,7 @@ mod tests {
             let list = gen_checking_list(&mut rng, &txome, read_length);
 
             let got = forseti_score_candidates(
-                &list, &names, &txome, &spline, &tracks, read_length, max_frag_len,
+                &list, &names, &spline, &tracks, read_length, max_frag_len,
             )
             .unwrap();
             let want = reference_score_candidates(

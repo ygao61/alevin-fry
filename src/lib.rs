@@ -26,5 +26,6 @@ pub mod multinomial;
 pub mod mlp_spline;
 pub mod forseti;
 pub mod track;
+pub mod seqstore;
 #[cfg(any(test, feature = "forseti-shadow"))]
 pub mod forseti_reference;

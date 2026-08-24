@@ -53,6 +53,7 @@ use crate::utils as afutils;
 use crate::mlp_spline::{load_mlp_params_from_str, load_spline_lookup_table_from_str, NativeMlp};
 use crate::forseti::build_status_lookup;
 use crate::track::TrackStore;
+use crate::seqstore::{FaiSeqStore, SeqSource};
 
 type BufferedGzFile = BufWriter<GzEncoder<fs::File>>;
 
@@ -1519,7 +1520,7 @@ pub fn do_quantify_forseti<T: BufRead, B >(
         // actually run.
         let use_forseti = matches!(resolution, ResolutionStrategy::ForsetiParsimonyEm);
 
-        let (mlp, spline_lookup, spliceu_txome, tx_status_lookup, tracks) = if use_forseti {
+        let (mlp, spline_lookup, tx_status_lookup, tracks) = if use_forseti {
             // ----------------------load mlp parameters---------------
             // The trained model and the fragment-length spline are shipped in
             // `resources/` and embedded at compile time, so a build carries
@@ -1544,27 +1545,35 @@ pub fn do_quantify_forseti<T: BufRead, B >(
                 );
             }
 
-            // -------prepare spliceu_txome------------
-            let mut spliceu_txome: HashMap<u32, Vec<u8>> = HashMap::new();
-            // read the spliceu fasta file (via needletail)
-            let spliceu_fa = quant_opts.spliceu_fa.context(
+            // spliceu sequences: served on demand from the .fai-indexed FASTA
+            // while track blocks are built; nothing resident (see seqstore.rs)
+            let spliceu_fa = quant_opts.spliceu_fa.as_ref().context(
                 "the forseti-parsimony-em resolution requires the spliceu transcriptome \
                  fasta; please provide it with --spliceu-fa",
             )?;
-            let mut fastx = parse_fastx_file(spliceu_fa).context("failed to open spliceu fasta")?;
-            while let Some(record) = fastx.next() {
-                let record = record.context("failed reading spliceu fasta record")?;
-                // header / id is bytes -> utf8 string
-                let mut ref_name = std::str::from_utf8(record.id())
-                    .context("spliceu fasta record id was not utf-8")?
-                    .to_string();
-
-                if let Some(&ref_id) = rname_to_id.get(&ref_name) {
-                    // store sequence as raw bytes (A/C/G/T/N...)
-                    spliceu_txome.insert(ref_id, record.seq().to_vec());
+            let seqs: Arc<dyn SeqSource> = {
+                let st = FaiSeqStore::open(spliceu_fa.as_ref(), &hdr.ref_names)?;
+                info!(log, "spliceu fasta indexed: {} of {} references have sequence ({:?}.fai)", st.n_present(), hdr.ref_names.len(), spliceu_fa);
+                Arc::new(st)
+            };
+            // shadow builds also keep the whole spliceu in memory for the frozen
+            // reference scorer (validation only)
+            #[cfg(feature = "forseti-shadow")]
+            let shadow_txome: Arc<HashMap<u32, Vec<u8>>> = {
+                let mut m: HashMap<u32, Vec<u8>> = HashMap::new();
+                let mut fastx = parse_fastx_file(spliceu_fa).context("failed to open spliceu fasta")?;
+                while let Some(record) = fastx.next() {
+                    let record = record.context("failed reading spliceu fasta record")?;
+                    let ref_name = std::str::from_utf8(record.id())
+                        .context("spliceu fasta record id was not utf-8")?
+                        .to_string();
+                    if let Some(&ref_id) = rname_to_id.get(&ref_name) {
+                        m.insert(ref_id, record.seq().to_vec());
+                    }
                 }
-            }
-            info!(log, "Finished. spliceu_txome has {} ref seqs.", spliceu_txome.len());
+                info!(log, "[forseti-shadow] spliceu_txome loaded in memory: {} ref seqs", m.len());
+                Arc::new(m)
+            };
             // build the tx status lookup table; this also enforces that the
             // t2g map is the 3-column (splicing status) flavor, which forseti
             // requires in order to tell spliced from unspliced candidates.
@@ -1573,17 +1582,18 @@ pub fn do_quantify_forseti<T: BufRead, B >(
             let mlp = Arc::new(mlp);
             // Per-transcript hot-position affinity tracks (track.rs): built
             // lazily, once per process, shared by every worker.
-            let tracks = TrackStore::new(hdr.ref_names.len(), tx_status_lookup.clone(), mlp.clone());
+            let tracks = TrackStore::new(hdr.ref_names.len(), tx_status_lookup.clone(), mlp.clone(), seqs);
+            #[cfg(feature = "forseti-shadow")]
+            let tracks = tracks.with_shadow_txome(shadow_txome);
 
             (
                 Some(mlp),
                 Some(Arc::new(spline_lookup)),
-                Some(Arc::new(spliceu_txome)),
                 Some(tx_status_lookup),
                 Some(Arc::new(tracks)),
             )
         } else {
-            (None, None, None, None, None)
+            (None, None, None, None)
         };
 
         // Share read-only resources across worker threads
@@ -1748,7 +1758,6 @@ pub fn do_quantify_forseti<T: BufRead, B >(
             let unmapped_count = bc_unmapped_map.clone();
             let mmrate = mmrate.clone();
             let ref_names = ref_names.clone();
-            let spliceu_txome = spliceu_txome.clone();
             let spline_lookup = spline_lookup.clone();
             let mlp = mlp.clone();
             let tracks = tracks.clone();
@@ -2032,10 +2041,6 @@ pub fn do_quantify_forseti<T: BufRead, B >(
                                             read_length,
                                             max_frag_len as u16,
                                             ref_names.as_ref(),
-                                            spliceu_txome
-                                                .as_ref()
-                                                .expect("forseti resources must be loaded")
-                                                .as_ref(),
                                             spline_lookup
                                                 .as_ref()
                                                 .expect("forseti resources must be loaded")
@@ -2432,6 +2437,9 @@ pub fn do_quantify_forseti<T: BufRead, B >(
         // Report the per-thread MLP affinity cache effectiveness (forseti scoring).
         let ts = crate::track::track_stats();
         if ts.tx_touched > 0 {
+            let (nf, nb) = crate::seqstore::fetch_stats();
+            info!(log, "spliceu sequence fetched on demand: {} fetches, {:.2} GB read (page cache, not resident)",
+                  nf.to_formatted_string(&Locale::en), nb as f64 / 1e9);
             info!(
                 log,
                 "Forseti tracks (U block {}): {} transcripts touched, {} blocks + {} tails built, {} fwd + {} rc hot positions ({:.1} MB), {} positions scanned, {} MLP evals, {:.1} CPU-s building; {} window queries used {} entries",

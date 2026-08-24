@@ -1404,7 +1404,6 @@ pub fn get_num_molecules_forseti(
     read_length: u16,
     max_frag_len: u16,
     ref_names: &[String],
-    spliceu_txome: &HashMap<u32, Vec<u8>>,
     spline_lookup: &Array1<f64>,
     tracks: &TrackStore,
     tx_status_lookup: &Vec<u8>,
@@ -1642,7 +1641,6 @@ pub fn get_num_molecules_forseti(
                     let forseti_result = forseti_for_multi_best(
                         &forseti_checking_list,
                         ref_names,
-                        spliceu_txome,
                         spline_lookup,
                         tracks,
                         read_length as u16,
@@ -1797,7 +1795,6 @@ pub fn get_num_molecules_forseti(
                 let forseti_result = forseti_for_multi_best(
                     &forseti_checking_list,
                     ref_names,
-                    spliceu_txome,
                     spline_lookup,
                     tracks,
                     read_length as u16,

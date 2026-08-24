@@ -174,7 +174,6 @@ fn shadow_check(
 pub fn forseti_for_multi_best(
     forseti_checking_list: &ForsetiCheckingList,
     ref_names: &[String],
-    spliceu_txome: &HashMap<u32, Vec<u8>>,
     spline_lookup: &Array1<f64>,
     tracks: &TrackStore,
     read_length: u16,
@@ -183,7 +182,6 @@ pub fn forseti_for_multi_best(
     let scored = forseti_score_candidates(
         forseti_checking_list,
         ref_names,
-        spliceu_txome,
         spline_lookup,
         tracks,
         read_length,
@@ -193,7 +191,7 @@ pub fn forseti_for_multi_best(
     shadow_check(
         forseti_checking_list,
         ref_names,
-        spliceu_txome,
+        tracks.shadow_txome().expect("shadow build: TrackStore::with_shadow_txome not set"),
         spline_lookup,
         tracks.mlp(),
         read_length,
@@ -218,7 +216,6 @@ pub fn forseti_for_multi_best(
 pub(crate) fn forseti_score_candidates(
     forseti_checking_list: &ForsetiCheckingList,
     ref_names: &[String],
-    spliceu_txome: &HashMap<u32, Vec<u8>>,
     spline_lookup: &Array1<f64>,
     tracks: &TrackStore,
     read_length: u16,
@@ -244,8 +241,8 @@ pub(crate) fn forseti_score_candidates(
     for (mcc_idx, (covering_txp_id, algn_tuple_list)) in forseti_checking_list.iter().enumerate() {
         let mut norm_sum_joint_prob = f64::NEG_INFINITY;
 
-        let ref_seq = match spliceu_txome.get(covering_txp_id) {
-            Some(seq) => seq.as_slice(),
+        let tx_ref_end = match tracks.len(*covering_txp_id) {
+            Some(l) => l,
             None => {
                 let nm = ref_names
                     .get(*covering_txp_id as usize)
@@ -256,7 +253,6 @@ pub(crate) fn forseti_score_candidates(
             }
         };
         let tid = *covering_txp_id;
-        let tx_ref_end = ref_seq.len();
         let all_forward = algn_tuple_list.iter().all(|algn_tuple| algn_tuple.0);
         let all_reverse = algn_tuple_list.iter().all(|algn_tuple| !algn_tuple.0);
 
@@ -305,7 +301,7 @@ pub(crate) fn forseti_score_candidates(
                     // fewer than one 30-mer in the window
                     continue;
                 }
-                tracks.fwd_hot(tid, ref_seq, overlap_wdow_start + 1, e - 30, &mut hot);
+                tracks.fwd_hot(tid, overlap_wdow_start + 1, e - 30, &mut hot);
                 if !hot.is_empty() {
                     let mut max_sum_log = f64::NEG_INFINITY;
                     for &(p, aff) in hot.iter() {
@@ -345,7 +341,7 @@ pub(crate) fn forseti_score_candidates(
                     .min(ovlp_wdow_dis_to_tx_end_30mer + 1 + polya_tail_len);
                 let valid_len = ovlp_wdow_length.saturating_sub(ovlp_wdow_dis_to_tx_end_30mer);
 
-                let tail_aff = tracks.tail(tid, ref_seq);
+                let tail_aff = tracks.tail(tid);
                 tail_sum_log_probs.clear();
                 tail_sum_log_probs.resize(valid_len, 0.0);
                 for &ref_start in &ref_start_list {
@@ -416,7 +412,7 @@ pub(crate) fn forseti_score_candidates(
                     continue;
                 }
                 if end_pos - start_pos >= 30 {
-                    tracks.rc_hot(tid, ref_seq, start_pos + 30, end_pos, &mut hot);
+                    tracks.rc_hot(tid, start_pos + 30, end_pos, &mut hot);
                     if !hot.is_empty() {
                         // New: add penalty for antisense reads
                         let anti_sense_penalty = 0.8;

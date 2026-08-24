@@ -23,6 +23,8 @@
 
 use crate::forseti::compute_has_6a;
 use crate::mlp_spline::NativeMlp;
+use crate::seqstore::SeqSource;
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
@@ -216,47 +218,83 @@ pub struct TrackStore {
     /// splicing status per transcript id (`b'U'` -> blocked storage)
     tx_status: Arc<Vec<u8>>,
     mlp: Arc<NativeMlp>,
+    /// transcript sequences, read only while a block/tail is built
+    seqs: Arc<dyn SeqSource>,
+    /// shadow builds: the whole spliceu in memory for the frozen reference scorer
+    #[cfg(feature = "forseti-shadow")]
+    shadow_txome: Option<Arc<std::collections::HashMap<u32, Vec<u8>>>>,
+}
+
+thread_local! {
+    // scratch for the sequence bytes of the block being built (one per thread,
+    // reused; a block never needs more than block_size + 2K bytes)
+    static SEQ_SCRATCH: RefCell<Vec<u8>> = RefCell::new(Vec::new());
 }
 
 impl TrackStore {
-    pub fn new(ref_count: usize, tx_status: Arc<Vec<u8>>, mlp: Arc<NativeMlp>) -> Self {
+    pub fn new(ref_count: usize, tx_status: Arc<Vec<u8>>, mlp: Arc<NativeMlp>, seqs: Arc<dyn SeqSource>) -> Self {
         debug_assert_eq!(mlp.k(), K);
         let slots = (0..ref_count).map(|_| OnceLock::new()).collect();
-        TrackStore { slots, tx_status, mlp }
+        TrackStore {
+            slots,
+            tx_status,
+            mlp,
+            seqs,
+            #[cfg(feature = "forseti-shadow")]
+            shadow_txome: None,
+        }
+    }
+
+    #[cfg(feature = "forseti-shadow")]
+    pub fn with_shadow_txome(mut self, txome: Arc<std::collections::HashMap<u32, Vec<u8>>>) -> Self {
+        self.shadow_txome = Some(txome);
+        self
+    }
+
+    #[cfg(feature = "forseti-shadow")]
+    pub fn shadow_txome(&self) -> Option<&std::collections::HashMap<u32, Vec<u8>>> {
+        self.shadow_txome.as_deref()
     }
 
     pub fn mlp(&self) -> &NativeMlp {
         &self.mlp
     }
 
+    /// Length of transcript `tid`, `None` if the reference has no sequence.
     #[inline]
-    fn slot(&self, tid: u32, seq: &[u8]) -> &TxSlot {
+    pub fn len(&self, tid: u32) -> Option<usize> {
+        self.seqs.len(tid)
+    }
+
+    #[inline]
+    fn slot(&self, tid: u32) -> &TxSlot {
         self.slots[tid as usize].get_or_init(|| {
             TX_TOUCHED.fetch_add(1, Ordering::Relaxed);
             let blocked = self
                 .tx_status
                 .get(tid as usize)
                 .map_or(false, |&s| s == UNSPLICED_STATUS);
-            Box::new(TxSlot::new(seq.len(), blocked))
+            let len = self.seqs.len(tid).expect("track requested for a transcript without sequence");
+            Box::new(TxSlot::new(len, blocked))
         })
     }
 
     #[inline]
-    fn block<'a>(&'a self, slot: &'a TxSlot, b: usize, seq: &[u8]) -> &'a Block {
-        slot.blocks[b].get_or_init(|| Box::new(self.build_block(seq, b * slot.block_size, slot.block_size)))
+    fn block<'a>(&'a self, slot: &'a TxSlot, b: usize, tid: u32) -> &'a Block {
+        slot.blocks[b].get_or_init(|| Box::new(self.build_block(tid, b * slot.block_size, slot.block_size)))
     }
 
     /// Hot forward-strand 30-mer starts `p` with `p_lo <= p <= p_hi`, in
     /// ascending order, appended to `out` (which is cleared first).
-    pub fn fwd_hot(&self, tid: u32, seq: &[u8], p_lo: usize, p_hi: usize, out: &mut Vec<(u32, f32)>) {
+    pub fn fwd_hot(&self, tid: u32, p_lo: usize, p_hi: usize, out: &mut Vec<(u32, f32)>) {
         out.clear();
         if p_lo > p_hi {
             return;
         }
-        let slot = self.slot(tid, seq);
+        let slot = self.slot(tid);
         let (b0, b1) = (p_lo / slot.block_size, p_hi / slot.block_size);
         for b in b0..=b1.min(slot.blocks.len() - 1) {
-            let blk = self.block(slot, b, seq);
+            let blk = self.block(slot, b, tid);
             blk.queries.fetch_add(1, Ordering::Relaxed);
             blk.fwd.collect(p_lo as u32, p_hi as u32, out);
         }
@@ -267,15 +305,15 @@ impl TrackStore {
     /// Hot reverse-complement 30-mers keyed by their forward-coordinate end
     /// `q` (the 30-mer is `revcomp(seq[q-30..q])`), `q_lo <= q <= q_hi`,
     /// ascending, appended to `out` (cleared first).
-    pub fn rc_hot(&self, tid: u32, seq: &[u8], q_lo: usize, q_hi: usize, out: &mut Vec<(u32, f32)>) {
+    pub fn rc_hot(&self, tid: u32, q_lo: usize, q_hi: usize, out: &mut Vec<(u32, f32)>) {
         out.clear();
         if q_lo > q_hi {
             return;
         }
-        let slot = self.slot(tid, seq);
+        let slot = self.slot(tid);
         let (b0, b1) = (q_lo / slot.block_size, q_hi / slot.block_size);
         for b in b0..=b1.min(slot.blocks.len() - 1) {
-            let blk = self.block(slot, b, seq);
+            let blk = self.block(slot, b, tid);
             blk.queries.fetch_add(1, Ordering::Relaxed);
             blk.rc.collect(q_lo as u32, q_hi as u32, out);
         }
@@ -287,25 +325,37 @@ impl TrackStore {
     /// (window `j` = last `29 - j` bases + `j + 1` `A`s); 0.0 where the window
     /// has no 6A run. Only meaningful for transcripts of >= 29 bases (the
     /// scorer never consults the tail otherwise).
-    pub fn tail(&self, tid: u32, seq: &[u8]) -> &[f32; TAIL_WINDOWS] {
-        let slot = self.slot(tid, seq);
-        slot.tail.get_or_init(|| Box::new(self.build_tail(seq)))
+    pub fn tail(&self, tid: u32) -> &[f32; TAIL_WINDOWS] {
+        let slot = self.slot(tid);
+        slot.tail.get_or_init(|| Box::new(self.build_tail(tid)))
     }
 
     // ------------------------------------------------------- builders ---
 
-    fn build_block(&self, seq: &[u8], start: usize, block_size: usize) -> Block {
+    fn build_block(&self, tid: u32, start: usize, block_size: usize) -> Block {
         let t0 = Instant::now();
-        let len = seq.len();
+        let len = self.seqs.len(tid).expect("block requested for a transcript without sequence");
         let mut hbuf = vec![0f32; self.mlp.hidden()];
         let mut evals = 0u64;
         let mut scanned = 0u64;
 
+        // byte ranges the two strands need, fetched once as their union
+        let end_p = (start + block_size).min(len.saturating_sub(K - 1)); // exclusive fwd start bound
+        let fwd_range = (start < end_p).then(|| (start, (end_p + K - 1).min(len)));
+        let q_lo = start.max(K);
+        let q_hi = (start + block_size - 1).min(len); // inclusive
+        let rc_range = (q_lo <= q_hi).then(|| (q_lo - K, q_hi));
+        let ulo = fwd_range.iter().chain(rc_range.iter()).map(|r| r.0).min().unwrap_or(0);
+        let uhi = fwd_range.iter().chain(rc_range.iter()).map(|r| r.1).max().unwrap_or(0);
+        SEQ_SCRATCH.with(|sc| {
+        let mut seqbuf = sc.borrow_mut();
+        self.seqs.fetch(tid, ulo, uhi, &mut seqbuf);
+        let seq_at = |a: usize, b: usize| &seqbuf[a - ulo..b - ulo];
+
         // ---- forward strand: starts p in [start, end_p) with p <= len - K
         let mut fwd = Strand::default();
-        let end_p = (start + block_size).min(len.saturating_sub(K - 1)); // exclusive
-        if start < end_p {
-            let sub = &seq[start..(end_p + K - 1).min(len)];
+        if let Some((a, b)) = fwd_range {
+            let sub = seq_at(a, b);
             let hot = compute_has_6a(sub, K, MIN_A_RUN);
             scanned += sub.len() as u64;
             for i in 0..(end_p - start) {
@@ -320,10 +370,8 @@ impl TrackStore {
 
         // ---- reverse strand: ends q in [start, start + block_size) with K <= q <= len
         let mut rc = Strand::default();
-        let q_lo = start.max(K);
-        let q_hi = (start + block_size - 1).min(len); // inclusive
-        if q_lo <= q_hi {
-            let sub = &seq[q_lo - K..q_hi];
+        if let Some((a, b)) = rc_range {
+            let sub = seq_at(a, b);
             let mut rcbuf = Vec::new();
             reverse_complement_into(sub, &mut rcbuf);
             let hot = compute_has_6a(&rcbuf, K, MIN_A_RUN);
@@ -351,6 +399,7 @@ impl TrackStore {
         rc.pos.shrink_to_fit();
         rc.aff.shrink_to_fit();
         Block { fwd, rc, queries: AtomicU32::new(0) }
+        })
     }
 
     /// Reuse statistics per storage class (spliced whole-transcript tracks vs
@@ -405,14 +454,14 @@ impl TrackStore {
         lines
     }
 
-    fn build_tail(&self, seq: &[u8]) -> [f32; TAIL_WINDOWS] {
+    fn build_tail(&self, tid: u32) -> [f32; TAIL_WINDOWS] {
         let t0 = Instant::now();
         let mut out = [0f32; TAIL_WINDOWS];
-        let len = seq.len();
+        let len = self.seqs.len(tid).expect("tail requested for a transcript without sequence");
         if len >= K - 1 {
             // last 29 bases + 15 A's: window j covers bytes [j, j + 30)
             let mut buf = Vec::with_capacity(K - 1 + TAIL_WINDOWS);
-            buf.extend_from_slice(&seq[len - (K - 1)..]);
+            self.seqs.fetch(tid, len - (K - 1), len, &mut buf);
             buf.extend(std::iter::repeat(b'A').take(TAIL_WINDOWS));
             let hot = compute_has_6a(&buf, K, MIN_A_RUN);
             let mut hbuf = vec![0f32; self.mlp.hidden()];

@@ -169,7 +169,15 @@ Per (MCC, txp): `compute_has_6a` (2 Vecs), `process_binding_affinity` (≥ 4 Vec
 
 ## 3. Memory
 
-### 3.1 HIGH — 23.5 GB spliceu transcriptome as `HashMap<u32, Vec<u8>>` (`quant.rs:1521-1538`)
+### 3.1 HIGH — 23.5 GB spliceu transcriptome as `HashMap<u32, Vec<u8>>` (`quant.rs:1521-1538`) — **done (tag forseti-fix20)**
+Implemented as `src/seqstore.rs`: the tracks (2.1) read a transcript's bytes exactly once while a block/tail is
+built, so the FASTA is no longer parsed or held; `FaiSeqStore` keeps the `.fai` index and serves each request with
+a positional read from the (shared, evictable) page cache. Measured (EPYC-7313, 32 threads, FASTA + `.fai` staged
+to local disk): pbmc_10k forseti quant RSS 47.7 → 17.5 GB, wall 6:38 → 6:30 (no start-up parse); pbmc_1k RSS
+39.7 → 11.1 GB, wall 1:12 → 1:05. Reads: 14.2 M fetches / 14.8 GB on pbmc_10k. Scores unchanged (synthetic
+test, shadow on pbmc_1k 0 mismatches, counts within the same-binary control). Requires `<fasta>.fai`
+(`samtools faidx`); a cold network FS is slow for the random reads — stage the FASTA locally. Original analysis:
+
 976,514 separate `Vec<u8>` + hashmap; ~23.5 GB resident for the whole run, parsed single-threaded before
 any worker starts. Options, from smallest change to best:
 - `Vec<Vec<u8>>` / flat `Vec<u8>` + offsets indexed by tid (removes hashing + 1 M allocations; same RSS).
@@ -232,6 +240,6 @@ data-proportional and shared.
    `forseti_checking_list` — one afternoon, measurable.
 3. Native MLP (drop libtorch) + `include_str!` params.
 4. ~~Per-transcript hot-position tracks + hot-only scoring (2.1)~~ **done (fix19)**; replaced 3.2.
-5. spliceu storage (3.1): 2-bit pack or mmap+fai; load only for Forseti.
+5. ~~spliceu storage (3.1)~~ **done (forseti-fix20)**: `.fai` + positional reads, nothing resident.
 6. libradicl record / collate allocation work (2.6, 3.3) — benefits all modes.
 7. Profile baseline quant memory (3.6).

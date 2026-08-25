@@ -150,8 +150,9 @@ fn reverse_complement_into(src: &[u8], dst: &mut Vec<u8>) {
             b'T' | b't' => b'A',
             b'C' | b'c' => b'G',
             b'G' | b'g' => b'C',
-            b'N' | b'n' => b'N',
-            other => panic!("Invalid nucleotide found: {}", other as char),
+            // anything else (N, IUPAC ambiguity codes, gaps) is unknown, as in
+            // the forward-strand encoder
+            _ => b'N',
         });
     }
 }
@@ -295,11 +296,11 @@ impl TrackStore {
         let (b0, b1) = (p_lo / slot.block_size, p_hi / slot.block_size);
         for b in b0..=b1.min(slot.blocks.len() - 1) {
             let blk = self.block(slot, b, tid);
-            blk.queries.fetch_add(1, Ordering::Relaxed);
+            crate::stat_add!(blk.queries, 1);
             blk.fwd.collect(p_lo as u32, p_hi as u32, out);
         }
-        QUERIES.fetch_add(1, Ordering::Relaxed);
-        USED_ENTRIES.fetch_add(out.len() as u64, Ordering::Relaxed);
+        crate::stat_add!(QUERIES, 1);
+        crate::stat_add!(USED_ENTRIES, out.len() as u64);
     }
 
     /// Hot reverse-complement 30-mers keyed by their forward-coordinate end
@@ -314,11 +315,11 @@ impl TrackStore {
         let (b0, b1) = (q_lo / slot.block_size, q_hi / slot.block_size);
         for b in b0..=b1.min(slot.blocks.len() - 1) {
             let blk = self.block(slot, b, tid);
-            blk.queries.fetch_add(1, Ordering::Relaxed);
+            crate::stat_add!(blk.queries, 1);
             blk.rc.collect(q_lo as u32, q_hi as u32, out);
         }
-        QUERIES.fetch_add(1, Ordering::Relaxed);
-        USED_ENTRIES.fetch_add(out.len() as u64, Ordering::Relaxed);
+        crate::stat_add!(QUERIES, 1);
+        crate::stat_add!(USED_ENTRIES, out.len() as u64);
     }
 
     /// Affinities of the poly-A-extended tail windows `j = 0..TAIL_WINDOWS`

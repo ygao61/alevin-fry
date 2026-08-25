@@ -7,7 +7,8 @@
 //! "improve" this file: a deliberate change of semantics is its own commit
 //! with a before/after comparison, after which this copy is re-frozen.
 //!
-//! Two deliberate differences from 3af81cf, neither changing a value: the
+//! Three deliberate differences from 3af81cf, none changing a value: the
+//! candidate index is `u32` instead of `u16` (type only, matching production); the
 //! per-thread MLP affinity cache is gone (it stored final affinities, so every
 //! hot 30-mer is simply evaluated directly), and the tail-arm test uses
 //! `tx_ref_end.wrapping_sub(30)` so that the release-build behaviour (the arm
@@ -116,7 +117,7 @@ pub(crate) fn reference_score_candidates(
     mlp: &NativeMlp,
     read_length: u16,
     max_frag_len: u16,
-) -> Result<Vec<(u16, f64)>> {
+) -> Result<Vec<(u32, f64)>> {
     // Set up parameters
     let snr_min_size = 6;
     let discount_perc = 1.0_f64;
@@ -140,7 +141,7 @@ pub(crate) fn reference_score_candidates(
     // ~98% of 30-mers have affinity 0, so add this instead of calling the costly .ln().
     let ln_eps = EPS.ln();
     // Per-candidate scores; the winner set is chosen in a second pass below.
-    let mut scored: Vec<(u16, f64)> = Vec::new();
+    let mut scored: Vec<(u32, f64)> = Vec::new();
 
 
     // Candidates are visited in check_mcc_list order (mcc_idx ascending), so the
@@ -434,7 +435,7 @@ pub(crate) fn reference_score_candidates(
         }
 
         // Just record the score here; the winner set is picked below.
-        scored.push((mcc_idx as u16, norm_sum_joint_prob));
+        scored.push((mcc_idx as u32, norm_sum_joint_prob));
     }
 
     Ok(scored)
@@ -634,8 +635,7 @@ mod tests {
 
             let got = forseti_score_candidates(
                 &list, &names, &spline, &tracks, read_length, max_frag_len,
-            )
-            .unwrap();
+            );
             let want = reference_score_candidates(
                 &list, &names, &txome, &spline, &mlp, read_length, max_frag_len,
             )
@@ -654,8 +654,8 @@ mod tests {
                 n_finite += (gs != f64::NEG_INFINITY) as usize;
             }
             n_scored += got.len();
-            let gw = select_best_mcc_indices(&got);
-            let ww = select_best_mcc_indices(&want);
+            let gw = select_best_mcc_indices(&got, 0.0);
+            let ww = select_best_mcc_indices(&want, 0.0);
             assert_eq!(gw, ww, "winner set differs: {}", ctx());
             n_winners += gw.len();
         }

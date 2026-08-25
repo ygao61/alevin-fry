@@ -68,6 +68,40 @@ pub struct PugResolutionStatistics {
     pub triv_mcc_forseti_needed: u64,
 }
 
+// Run-wide sums of the per-cell PugResolutionStatistics of the forseti path.
+static FS: [std::sync::atomic::AtomicU64; 12] = [const { std::sync::atomic::AtomicU64::new(0) }; 12];
+
+pub fn accumulate_forseti_stats(s: &PugResolutionStatistics) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let v = [
+        s.total_mccs, s.trivial_mccs, s.ambiguous_mccs,
+        s.non_triv_mccs_determined_ss.0, s.non_triv_mccs_determined_ss.1, s.non_triv_single_gene_ambiguous_ss, s.large_mcc_forseti_needed,
+        s.triv_mcc_check, s.triv_mccs_determined_ss.0, s.triv_mccs_determined_ss.1, s.triv_single_gene_ambiguous_ss, s.triv_mcc_forseti_needed,
+    ];
+    for (a, x) in FS.iter().zip(v) {
+        a.fetch_add(x, Relaxed);
+    }
+}
+
+/// Human-readable summary of `accumulate_forseti_stats`, one line per group.
+pub fn forseti_stats_report() -> Vec<String> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let v: Vec<u64> = FS.iter().map(|a| a.load(Relaxed)).collect();
+    if v[0] == 0 {
+        return Vec::new();
+    }
+    let pct = |a: u64, b: u64| if b == 0 { 0.0 } else { 100.0 * a as f64 / b as f64 };
+    let nt = v[0] - v[1];
+    vec![
+        format!("Forseti PUG summary: {} molecules (MCCs) = {} single-vertex + {} multi-vertex; {} ended multi-gene (ambiguous, EM decides)",
+                v[0], v[1], nt, v[2]),
+        format!("  multi-vertex: forseti called for {} ({:.1}%); after resolution {} single txp, {} single gene+status, {} single gene but S/U-ambiguous",
+                v[6], pct(v[6], nt), v[3], v[4], v[5]),
+        format!("  single-vertex: forseti called for {} of {} ({:.1}%); after resolution {} single txp, {} single gene+status, {} single gene but S/U-ambiguous",
+                v[11], v[7], pct(v[11], v[7]), v[8], v[9], v[10]),
+    ]
+}
+
 /// Allowed suffix categories for transcript names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SuffixType {
@@ -1403,6 +1437,7 @@ pub fn get_num_molecules_forseti(
     cell_reads: &[AlevinFryReadRecordWithPosition],
     read_length: u16,
     max_frag_len: u16,
+    forseti_margin: f64,
     ref_names: &[String],
     spline_lookup: &Array1<f64>,
     tracks: &TrackStore,
@@ -1638,41 +1673,29 @@ pub fn get_num_molecules_forseti(
                     let forseti_checking_list = get_forseti_check_list(cell_reads, &check_mcc_list);
                     // forseti_result returns the iter_idx and max score, allow multiple best score(to a list)
 
-                    let forseti_result = forseti_for_multi_best(
+                    let best_mcc_indices = forseti_for_multi_best(
                         &forseti_checking_list,
                         ref_names,
                         spline_lookup,
                         tracks,
                         read_length as u16,
                         max_frag_len,
+                        forseti_margin,
                     );
-
-                    match forseti_result {
-                        Ok(best_mcc_indices) => {
-                            find_single_best = best_mcc_indices.len() == 1;
-
-                            for mcc_idx in &best_mcc_indices {
-                                let mcc_info_tuple = &check_mcc_list[*mcc_idx as usize];
-                                let predict_best_cvr_txp = mcc_info_tuple.1;
-                                let predict_best_mcc = mcc_info_tuple.0.clone();
-                                // best_mcc_indices is in mcc_idx order, so the first
-                                // entry is the lowest-index winner; remember its MCC as
-                                // the deterministic tie-break below.
-                                if first_best_mcc.is_none() {
-                                    first_best_mcc = Some(predict_best_mcc.clone());
-                                }
-                                filtered_mcc_txp_pairs.entry(predict_best_mcc)
-                                    .or_insert(Vec::new())
-                                    .push(predict_best_cvr_txp);
-                            }
+                    find_single_best = best_mcc_indices.len() == 1;
+                    for mcc_idx in &best_mcc_indices {
+                        let mcc_info_tuple = &check_mcc_list[*mcc_idx as usize];
+                        let predict_best_cvr_txp = mcc_info_tuple.1;
+                        let predict_best_mcc = mcc_info_tuple.0.clone();
+                        // best_mcc_indices is in mcc_idx order, so the first
+                        // entry is the lowest-index winner; remember its MCC as
+                        // the deterministic tie-break below.
+                        if first_best_mcc.is_none() {
+                            first_best_mcc = Some(predict_best_mcc.clone());
                         }
-                        Err(e) => {
-                            eprintln!(
-                                "Error occurred when process the result from forseti: {:?}",
-                                e
-                            );
-                            std::process::exit(1);
-                        }
+                        filtered_mcc_txp_pairs.entry(predict_best_mcc)
+                            .or_insert(Vec::new())
+                            .push(predict_best_cvr_txp);
                     }
                     // after forseti
                     global_txps.clear(); //reset global_txps
@@ -1792,33 +1815,21 @@ pub fn get_num_molecules_forseti(
 
                 let forseti_checking_list = get_forseti_check_list(cell_reads, &check_mcc_list);
 
-                let forseti_result = forseti_for_multi_best(
+                let best_mcc_indices = forseti_for_multi_best(
                     &forseti_checking_list,
                     ref_names,
                     spline_lookup,
                     tracks,
                     read_length as u16,
                     max_frag_len,
+                    forseti_margin,
                 );
-                
                 predict_best_cvr_txp_list.clear();
-                match forseti_result {
-                    Ok(best_mcc_indices) => {
-                        // assign single best = 1(mcc,txp)
-                        find_single_best = best_mcc_indices.len() == 1;
-
-                        for mcc_idx in &best_mcc_indices {
-                            let mcc_info_tuple = &check_mcc_list[*mcc_idx as usize];
-                            predict_best_cvr_txp_list.push(mcc_info_tuple.1);
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "Error occurred when process the result from forseti: {:?}",
-                            e
-                        );
-                        std::process::exit(1);
-                    }
+                // assign single best = 1(mcc,txp)
+                find_single_best = best_mcc_indices.len() == 1;
+                for mcc_idx in &best_mcc_indices {
+                    let mcc_info_tuple = &check_mcc_list[*mcc_idx as usize];
+                    predict_best_cvr_txp_list.push(mcc_info_tuple.1);
                 }
                 if predict_best_cvr_txp_list.len() > 0 {
                     // update the global genes only if the forseti has valid output.

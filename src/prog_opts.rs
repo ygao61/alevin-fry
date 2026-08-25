@@ -36,6 +36,9 @@ pub struct QuantOpts<'a, 'b, 'c, 'd, 'e, 'f, 'g, 'h> {
     pub small_thresh: usize,
     pub large_graph_thresh: usize,
     pub max_frag_len: u16,
+    /// forseti: a candidate is kept as a co-winner if its score is within this
+    /// margin of the best (mean log-probability per alignment); 0 = ties only
+    pub forseti_margin: f64,
     pub filter_list: Option<&'d PathBuf>,
     /// only required (and only used) by the forseti resolution strategy
     pub spliceu_fa: Option<&'h PathBuf>,

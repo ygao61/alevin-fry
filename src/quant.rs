@@ -1219,17 +1219,21 @@ where
 
     // push the work onto the queue for the worker threads
     // we spawned above.
-    let _ = if let Some(ret_bc) = retained_bc {
+    if let Some(ret_bc) = retained_bc {
         let filter_fn = |buf: &[u8], record_context: &<R as MappedRecord>::ParsingContext| -> bool {
             let ch =
                 R::peek_collatable_header(&buf[8..], record_context).expect("at least one record");
             let ck: u64= ch.collate_key().into();
             ret_bc.contains(&ck)
         };
-        chunk_reader.start_filtered(&mut br, filter_fn, Some(cb))
+        chunk_reader
+            .start_filtered(&mut br, filter_fn, Some(cb))
+            .context("reading the RAD file failed while feeding the worker threads")?;
     } else {
-        chunk_reader.start(&mut br, Some(cb))
-    };
+        chunk_reader
+            .start(&mut br, Some(cb))
+            .context("reading the RAD file failed while feeding the worker threads")?;
+    }
 
     let gn_path = output_matrix_path.join("quants_mat_cols.txt");
     let gn_file = File::create(gn_path).expect("couldn't create gene name file.");
@@ -1257,15 +1261,20 @@ where
     }
 
     let mut total_records = 0usize;
+    let mut num_panicked = 0usize;
     for h in thread_handles {
         match h.join() {
             Ok(rc) => {
                 total_records += rc;
             }
             Err(_e) => {
-                info!(log, "thread panicked");
+                num_panicked += 1;
             }
         }
+    }
+    if num_panicked > 0 {
+        crit!(log, "{} worker thread(s) panicked; refusing to write output", num_panicked);
+        anyhow::bail!("quantification failed: {} worker thread(s) panicked", num_panicked);
     }
 
     // write to matrix market if we are using it
@@ -1364,6 +1373,7 @@ pub fn do_quantify_forseti<T: BufRead, B >(
         let small_thresh = quant_opts.small_thresh;
         let large_graph_thresh = quant_opts.large_graph_thresh;
         let max_frag_len = quant_opts.max_frag_len;
+        let forseti_margin = quant_opts.forseti_margin;
         let filter_list = quant_opts.filter_list;
         let log = quant_opts.log;
         let num_threads = quant_opts.num_threads;
@@ -1485,8 +1495,10 @@ pub fn do_quantify_forseti<T: BufRead, B >(
         let read_length: u16 = match file_tag_map.get("rlen") {
             Some(v) => v.try_into()?,
             None => {
-                info!(log, "File-level tag `rlen` not present; setting read_length=0.");
-                0_u16
+                anyhow::bail!(
+                    "the RAD file has no `rlen` file-level tag; forseti needs the read length \
+                     for its fragment model (map with a piscem version that records it)"
+                );
             }
         };
         
@@ -1554,6 +1566,21 @@ pub fn do_quantify_forseti<T: BufRead, B >(
             let seqs: Arc<dyn SeqSource> = {
                 let st = FaiSeqStore::open(spliceu_fa.as_ref(), &hdr.ref_names)?;
                 info!(log, "spliceu fasta indexed: {} of {} references have sequence ({:?}.fai)", st.n_present(), hdr.ref_names.len(), spliceu_fa);
+                if st.n_present() != hdr.ref_names.len() {
+                    let missing = st.missing_names(&hdr.ref_names, 5);
+                    if std::env::var_os("FORSETI_ALLOW_MISSING_SEQ").is_some() {
+                        warn!(log, "{} references have no sequence in {:?} (e.g. {:?}); candidates on them are dropped because FORSETI_ALLOW_MISSING_SEQ is set",
+                              hdr.ref_names.len() - st.n_present(), spliceu_fa, missing);
+                    } else {
+                        anyhow::bail!(
+                            "{} of {} RAD references have no sequence in {:?} (e.g. {:?}). \
+                             Forseti must see every spliced and unspliced transcript of the index; \
+                             pass the spliceu FASTA the index was built from (set FORSETI_ALLOW_MISSING_SEQ=1 \
+                             to drop candidates on the missing transcripts instead)",
+                            hdr.ref_names.len() - st.n_present(), hdr.ref_names.len(), spliceu_fa, missing
+                        );
+                    }
+                }
                 Arc::new(st)
             };
             // shadow builds also keep the whole spliceu in memory for the frozen
@@ -2030,7 +2057,7 @@ pub fn do_quantify_forseti<T: BufRead, B >(
                                         // TODO: use the cell barcode string for fixed hasher.
                                         // let bc_hash = s.hash_one(&bc_str);
                                         let cell_hasher = ahash::RandomState::with_seeds(bc.into(), 7u64, 1u64, 8u64);
-                                        let _pug_stats = pugutils::get_num_molecules_forseti(
+                                        let pug_stats = pugutils::get_num_molecules_forseti(
                                             &g,
                                             &eq_map,
                                             &tid_to_gid,
@@ -2040,6 +2067,7 @@ pub fn do_quantify_forseti<T: BufRead, B >(
                                             &c.reads,
                                             read_length,
                                             max_frag_len as u16,
+                                            forseti_margin,
                                             ref_names.as_ref(),
                                             spline_lookup
                                                 .as_ref()
@@ -2052,6 +2080,8 @@ pub fn do_quantify_forseti<T: BufRead, B >(
                                                 .as_ref(),
                                             &log,
                                         );
+                                        alt_resolution = pug_stats.used_alternative_strategy;
+                                        crate::pugutils::accumulate_forseti_stats(&pug_stats);
                                         // clear eqmap state for next cell (matches other resolution branches)
                                         eq_map.clear();
     
@@ -2362,17 +2392,21 @@ pub fn do_quantify_forseti<T: BufRead, B >(
     
         // push the work onto the queue for the worker threads
         // we spawned above.
-        let _ = if let Some(ret_bc) = retained_bc {
+        if let Some(ret_bc) = retained_bc {
             let filter_fn = |buf: &[u8], record_context: &<R as MappedRecord>::ParsingContext| -> bool {
                 let ch =
                     R::peek_collatable_header(&buf[8..], record_context).expect("at least one record");
                 let ck: u64= ch.collate_key().into();
                 ret_bc.contains(&ck)
             };
-            chunk_reader.start_filtered(&mut br, filter_fn, Some(cb))
+            chunk_reader
+                .start_filtered(&mut br, filter_fn, Some(cb))
+                .context("reading the RAD file failed while feeding the worker threads")?;
         } else {
-            chunk_reader.start(&mut br, Some(cb))
-        };
+            chunk_reader
+                .start(&mut br, Some(cb))
+                .context("reading the RAD file failed while feeding the worker threads")?;
+        }
     
         let gn_path = output_matrix_path.join("quants_mat_cols.txt");
         let gn_file = File::create(gn_path).expect("couldn't create gene name file.");
@@ -2400,15 +2434,20 @@ pub fn do_quantify_forseti<T: BufRead, B >(
         }
     
         let mut total_records = 0usize;
+        let mut num_panicked = 0usize;
         for h in thread_handles {
             match h.join() {
                 Ok(rc) => {
                     total_records += rc;
                 }
                 Err(_e) => {
-                    info!(log, "thread panicked");
+                    num_panicked += 1;
                 }
             }
+        }
+        if num_panicked > 0 {
+            crit!(log, "{} worker thread(s) panicked; refusing to write output", num_panicked);
+            anyhow::bail!("quantification failed: {} worker thread(s) panicked", num_panicked);
         }
     
         // write to matrix market if we are using it
@@ -2456,13 +2495,43 @@ pub fn do_quantify_forseti<T: BufRead, B >(
                 ts.queries.to_formatted_string(&Locale::en),
                 ts.used_entries.to_formatted_string(&Locale::en)
             );
-            if let Some(tr) = tracks.as_ref() {
+            if !crate::forseti::STATS_ENABLED {
+                info!(log, "Forseti per-query / per-decision counters are compiled out; build with --features forseti-stats for the track-reuse and decision summaries");
+            }
+            if let Some(tr) = tracks.as_ref().filter(|_| crate::forseti::STATS_ENABLED) {
                 // per-block TSV only on request (FORSETI_TRACK_REPORT=<path>)
                 let tsv = std::env::var_os("FORSETI_TRACK_REPORT").map(std::path::PathBuf::from);
                 for line in tr.reuse_report(tsv.as_deref()) {
                     info!(log, "{}", line);
                 }
             }
+        }
+        for line in crate::pugutils::forseti_stats_report() {
+            info!(log, "{}", line);
+        }
+        if let Some((p, n)) = crate::forseti::write_gap_dump() {
+            info!(log, "Forseti gap dump: {} single-winner decisions written to {:?}", n, p);
+        }
+        let gs = crate::forseti::gap_stats();
+        let ds = crate::forseti::decision_stats();
+        if ds[2] > 0 {
+            let e = crate::forseti::GAP_EDGES;
+            info!(
+                log,
+                "Forseti single-winner score gap (winner - runner-up, mean log-prob per alignment): <{}: {}, {}-{}: {}, {}-{}: {}, {}-{}: {}, {}-{}: {}, {}-{}: {}, >={}: {}, unopposed: {}",
+                e[0], gs[0], e[0], e[1], gs[1], e[1], e[2], gs[2], e[2], e[3], gs[3], e[3], e[4], gs[4], e[4], e[5], gs[5], e[5], gs[6], gs[7]
+            );
+        }
+        if ds[0] > 0 {
+            info!(
+                log,
+                "Forseti decisions: {} candidate lists -> {} single winner ({:.1}%), {} tie ({:.1}%), {} abstain ({:.1}%); {} candidates: {} unscored, {} dropped (window past last 30-mer), {} dropped (invalid); {} clipped alignments treated as pos 0",
+                ds[0].to_formatted_string(&Locale::en), ds[2].to_formatted_string(&Locale::en), 100.0 * ds[2] as f64 / ds[0] as f64,
+                ds[3].to_formatted_string(&Locale::en), 100.0 * ds[3] as f64 / ds[0] as f64,
+                ds[1].to_formatted_string(&Locale::en), 100.0 * ds[1] as f64 / ds[0] as f64,
+                ds[4].to_formatted_string(&Locale::en), ds[5].to_formatted_string(&Locale::en), ds[6].to_formatted_string(&Locale::en),
+                ds[7].to_formatted_string(&Locale::en), ds[8].to_formatted_string(&Locale::en)
+            );
         }
         // Shadow-mode report (only non-zero in `--features forseti-shadow` builds):
         // every real candidate list was also scored by the frozen reference scorer.
@@ -2483,11 +2552,16 @@ pub fn do_quantify_forseti<T: BufRead, B >(
         if dump_eq {
             write_eqc_counts(&eqid_map_lock, num_rows, usa_mode, &output_matrix_path, log)?;
         }
+        // The track store holds millions of small allocations; dropping them one
+        // by one costs seconds (17 s on pbmc_10k) for nothing the process will
+        // use again, so leak it and let the OS reclaim the pages at exit.
+        std::mem::forget(tracks);
     
         let meta_info = json!({
         "cmd" : quant_opts.cmdline,
         "version_str": quant_opts.version,
         "resolution_strategy" : resolution.to_string(),
+        "forseti_margin" : forseti_margin,
         "num_quantified_cells" : num_cells,
         "num_genes" : num_rows,
         "dump_eq" : dump_eq,

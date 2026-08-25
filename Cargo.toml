@@ -132,3 +132,7 @@ aarch64-apple-darwin = "macos-14"
 # per-window scorer (src/forseti_reference.rs) and count bit-level mismatches.
 # Test/validation builds only: `cargo build --release --features forseti-shadow`.
 forseti-shadow = []
+# Per-candidate-list / per-window-query counters behind the end-of-run decision
+# and track-reuse summaries. Each is a contended atomic RMW shared by all workers,
+# so they are compiled in only on request: `cargo build --release --features forseti-stats`.
+forseti-stats = []

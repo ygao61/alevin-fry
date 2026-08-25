@@ -93,7 +93,11 @@ pub fn build_status_lookup(
         }
 
         let tx_name = cols[0];
-        let status_char = cols[2].as_bytes()[0]; // Take 'S', 'U', or 'T'
+        // 'S', 'U' or 'T'; the t2g parser accepts either case
+        let status_char = match cols[2].as_bytes().first() {
+            Some(b) => b.to_ascii_uppercase(),
+            None => bail!("Error: empty splicing-status column at line {} of {:?}", line_idx + 1, t2g_path),
+        };
 
         // 3. Store status using tx_id as the index
         if let Some(&tx_id) = name_to_id.get(tx_name) {
@@ -110,6 +114,94 @@ pub fn build_status_lookup(
 pub static SHADOW_LISTS: AtomicU64 = AtomicU64::new(0);
 pub static SHADOW_CANDIDATES: AtomicU64 = AtomicU64::new(0);
 pub static SHADOW_MISMATCHES: AtomicU64 = AtomicU64::new(0);
+
+// Per-run accounting of what the resolver did (relaxed atomics, one add per
+// candidate list plus one per candidate).
+/// Hot-path counters (one RMW per candidate list or per window query, shared
+/// by every worker) are compiled in only with `--features forseti-stats`.
+/// Without it the statics stay 0 and the end-of-run summaries are skipped.
+pub const STATS_ENABLED: bool = cfg!(feature = "forseti-stats");
+#[macro_export]
+macro_rules! stat_add {
+    ($c:expr, $n:expr) => {{
+        #[cfg(feature = "forseti-stats")]
+        {
+            $c.fetch_add($n, ::std::sync::atomic::Ordering::Relaxed);
+        }
+        #[cfg(not(feature = "forseti-stats"))]
+        {
+            let _ = (&$c, $n);
+        }
+    }};
+}
+
+pub static DEC_LISTS: AtomicU64 = AtomicU64::new(0); // candidate lists scored
+pub static DEC_ABSTAIN: AtomicU64 = AtomicU64::new(0); // no candidate could be scored
+pub static DEC_SINGLE: AtomicU64 = AtomicU64::new(0); // exactly one winner
+pub static DEC_TIE: AtomicU64 = AtomicU64::new(0); // several winners within TIE_EPS
+/// Per-candidate diagnostics used to be unbounded `eprintln!`s: a mismatched
+/// index/FASTA printed one line per candidate. Print the first few, then rely
+/// on the counters reported in the decision summary.
+static WARN_COUNT: AtomicU64 = AtomicU64::new(0);
+const WARN_LIMIT: u64 = 20;
+fn warn_capped(msg: impl FnOnce() -> String) {
+    let n = WARN_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < WARN_LIMIT {
+        eprintln!("[forseti] {}", msg());
+    } else if n == WARN_LIMIT {
+        eprintln!("[forseti] further per-candidate warnings suppressed; see the decision summary in the log");
+    }
+}
+
+pub static CAND_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static CAND_UNSCORED: AtomicU64 = AtomicU64::new(0); // reached the end without a window score
+pub static CAND_DROPPED_OVERHANG: AtomicU64 = AtomicU64::new(0); // tail arm `continue` (window start past the last 30-mer)
+pub static CAND_DROPPED_INVALID: AtomicU64 = AtomicU64::new(0); // ref_start beyond the reference, mixed strands, no sequence
+pub static ALN_CLIPPED: AtomicU64 = AtomicU64::new(0); // soft-clip sentinel positions treated as 0
+
+/// Single-winner decisions binned by the score gap between the winner and the
+/// runner-up (scores are mean log-probability per alignment, so a gap of
+/// ln 2 = 0.69 means the winner is 2x more likely per alignment). Last bin:
+/// no scorable runner-up at all ("unopposed").
+pub const GAP_EDGES: [f64; 6] = [0.01, 0.1, 0.5, 1.0, 2.0, 5.0];
+pub static GAP_BINS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// Optional dump of (winner score, runner-up score) per single-winner decision,
+/// enabled by `FORSETI_GAP_DUMP=<path>` (written at the end of the run).
+static GAP_DUMP: std::sync::Mutex<Vec<(f32, f32)>> = std::sync::Mutex::new(Vec::new());
+fn gap_dump_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FORSETI_GAP_DUMP").is_some())
+}
+pub fn write_gap_dump() -> Option<(std::path::PathBuf, usize)> {
+    let path = std::path::PathBuf::from(std::env::var_os("FORSETI_GAP_DUMP")?);
+    let v = GAP_DUMP.lock().unwrap();
+    let mut out = String::with_capacity(v.len() * 24);
+    out.push_str("winner\trunner_up\n");
+    for (a, b) in v.iter() {
+        out.push_str(&format!("{}\t{}\n", a, b));
+    }
+    std::fs::write(&path, out).ok()?;
+    Some((path, v.len()))
+}
+
+pub fn gap_stats() -> [u64; 8] {
+    std::array::from_fn(|i| GAP_BINS[i].load(Ordering::Relaxed))
+}
+
+pub fn decision_stats() -> [u64; 9] {
+    [
+        DEC_LISTS.load(Ordering::Relaxed),
+        DEC_ABSTAIN.load(Ordering::Relaxed),
+        DEC_SINGLE.load(Ordering::Relaxed),
+        DEC_TIE.load(Ordering::Relaxed),
+        CAND_TOTAL.load(Ordering::Relaxed),
+        CAND_UNSCORED.load(Ordering::Relaxed),
+        CAND_DROPPED_OVERHANG.load(Ordering::Relaxed),
+        CAND_DROPPED_INVALID.load(Ordering::Relaxed),
+        ALN_CLIPPED.load(Ordering::Relaxed),
+    ]
+}
 
 pub fn shadow_stats() -> (u64, u64, u64) {
     (
@@ -132,7 +224,7 @@ fn shadow_check(
     mlp: &NativeMlp,
     read_length: u16,
     max_frag_len: u16,
-    scored: &[(u16, f64)],
+    scored: &[(u32, f64)],
 ) {
     const PRINT_LIMIT: u64 = 20;
     let want = match crate::forseti_reference::reference_score_candidates(
@@ -178,7 +270,8 @@ pub fn forseti_for_multi_best(
     tracks: &TrackStore,
     read_length: u16,
     max_frag_len: u16,
-) -> Result<Vec<u16>> {
+    margin: f64,
+) -> Vec<u32> {
     let scored = forseti_score_candidates(
         forseti_checking_list,
         ref_names,
@@ -186,7 +279,7 @@ pub fn forseti_for_multi_best(
         tracks,
         read_length,
         max_frag_len,
-    )?;
+    );
     #[cfg(feature = "forseti-shadow")]
     shadow_check(
         forseti_checking_list,
@@ -198,7 +291,37 @@ pub fn forseti_for_multi_best(
         max_frag_len,
         &scored,
     );
-    Ok(select_best_mcc_indices(&scored))
+    let best = select_best_mcc_indices(&scored, margin);
+    stat_add!(DEC_LISTS, 1);
+    match best.len() {
+        0 => stat_add!(DEC_ABSTAIN, 1),
+        1 if !(STATS_ENABLED || gap_dump_enabled()) => {}
+        1 => {
+            // gap to the best finite score among the other candidates
+            let (mut top, mut second) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+            for &(_, s) in &scored {
+                if s > top {
+                    second = top;
+                    top = s;
+                } else if s > second {
+                    second = s;
+                }
+            }
+            if gap_dump_enabled() {
+                GAP_DUMP.lock().unwrap().push((top as f32, second as f32));
+            }
+            let bin = if second == f64::NEG_INFINITY {
+                7
+            } else {
+                let gap = top - second;
+                GAP_EDGES.iter().position(|&e| gap < e).unwrap_or(6)
+            };
+            stat_add!(GAP_BINS[bin], 1);
+            stat_add!(DEC_SINGLE, 1)
+        }
+        _ => stat_add!(DEC_TIE, 1),
+    };
+    best
 }
 
 /// Score every candidate (MCC, transcript) pair in `forseti_checking_list`.
@@ -220,7 +343,7 @@ pub(crate) fn forseti_score_candidates(
     tracks: &TrackStore,
     read_length: u16,
     max_frag_len: u16,
-) -> Result<Vec<(u16, f64)>> {
+) -> Vec<(u32, f64)> {
     let polya_tail_len = 200;
     let max_frag_len = max_frag_len as usize;
 
@@ -234,10 +357,11 @@ pub(crate) fn forseti_score_candidates(
     // Every "affinity == 0" term is ln(0*frag_prob + EPS) = ln(EPS), a constant.
     let ln_eps = EPS.ln();
     // Per-candidate scores; the winner set is chosen by the caller.
-    let mut scored: Vec<(u16, f64)> = Vec::new();
+    let mut scored: Vec<(u32, f64)> = Vec::new();
 
     // Candidates are visited in check_mcc_list order (mcc_idx ascending), so the
     // order of the returned list is deterministic.
+    stat_add!(CAND_TOTAL, forseti_checking_list.len() as u64);
     for (mcc_idx, (covering_txp_id, algn_tuple_list)) in forseti_checking_list.iter().enumerate() {
         let mut norm_sum_joint_prob = f64::NEG_INFINITY;
 
@@ -248,7 +372,8 @@ pub(crate) fn forseti_score_candidates(
                     .get(*covering_txp_id as usize)
                     .map(|s| s.as_str())
                     .unwrap_or("<unknown>");
-                eprintln!("Error: ref_id {} (name {}) not found in spliceu_txome.", covering_txp_id, nm);
+                warn_capped(|| format!("ref_id {} (name {}) has no sequence in the spliceu fasta; candidate dropped", covering_txp_id, nm));
+                stat_add!(CAND_DROPPED_INVALID, 1);
                 continue;
             }
         };
@@ -266,12 +391,12 @@ pub(crate) fn forseti_score_candidates(
                 // NOTE: Mimic softclip: a start "close to 2^32" is a clipped
                 // alignment and is treated as position 0.
                 if ref_start_u32 > invalid_pos_limit {
+                    stat_add!(ALN_CLIPPED, 1);
                     ref_start_list.push(0usize);
                 } else {
                     let rs = ref_start_u32 as usize;
                     if rs > tx_ref_end {
-                        println!("ref_start: {}", rs);
-                        eprintln!("Error: ref_start is not close to 2^32, but exceed ref length");
+                        warn_capped(|| format!("ref_start {} exceeds the length {} of ref_id {}; candidate dropped", rs, tx_ref_end, covering_txp_id));
                         mcc_invalid = true;
                         break;
                     }
@@ -279,10 +404,12 @@ pub(crate) fn forseti_score_candidates(
                 }
             }
             if mcc_invalid {
+                stat_add!(CAND_DROPPED_INVALID, 1);
                 continue;
             }
             if ref_start_list.is_empty() {
-                eprintln!("ref_start_list is empty! Should not happen.");
+                warn_capped(|| "candidate with no alignments; dropped".to_string());
+                stat_add!(CAND_DROPPED_INVALID, 1);
                 continue;
             }
             let n_alns = ref_start_list.len() as f64;
@@ -334,6 +461,7 @@ pub(crate) fn forseti_score_candidates(
 
                 let tx_end_30mer_start = tx_ref_end.saturating_sub(29);
                 if overlap_wdow_start >= tx_end_30mer_start {
+                    stat_add!(CAND_DROPPED_OVERHANG, 1);
                     continue; // skip the overhanging cases (drops the candidate, as before)
                 }
                 let ovlp_wdow_dis_to_tx_end_30mer = tx_end_30mer_start - overlap_wdow_start;
@@ -374,9 +502,10 @@ pub(crate) fn forseti_score_candidates(
                 let mut ref_start = ref_start_u32 as usize;
                 if ref_start_u32 > invalid_pos_limit {
                     // mimic softclip
+                    stat_add!(ALN_CLIPPED, 1);
                     ref_start = 0usize;
                 } else if ref_start > tx_ref_end {
-                    eprintln!("Error: ref_start is not close to 2^32, but exceed ref length. This should not happen.");
+                    warn_capped(|| format!("ref_start {} exceeds the length {} of ref_id {}; candidate dropped", ref_start, tx_ref_end, covering_txp_id));
                     mcc_invalid = true;
                     break;
                 }
@@ -387,6 +516,7 @@ pub(crate) fn forseti_score_candidates(
                 ref_end_list.push(ref_end);
             }
             if mcc_invalid {
+                stat_add!(CAND_DROPPED_INVALID, 1);
                 continue;
             }
             let n_alns = ref_end_list.len() as f64;
@@ -438,20 +568,26 @@ pub(crate) fn forseti_score_candidates(
                 continue;
             }
         } else {
-            eprintln!("Error: algn_tuple_list is not all forward or all reverse. This should not happen.");
+            warn_capped(|| "candidate with mixed-strand alignments; dropped".to_string());
+            stat_add!(CAND_DROPPED_INVALID, 1);
             continue;
         }
 
         // Just record the score here; the winner set is picked by the caller.
-        scored.push((mcc_idx as u16, norm_sum_joint_prob));
+        if norm_sum_joint_prob == f64::NEG_INFINITY {
+            stat_add!(CAND_UNSCORED, 1);
+        }
+        scored.push((mcc_idx as u32, norm_sum_joint_prob));
     }
 
-    Ok(scored)
+    scored
 }
 
 /// Pick the winner set from per-candidate scores: the true maximum first,
-/// then every candidate within `TIE_EPS` of it, in mcc_idx order.
-pub(crate) fn select_best_mcc_indices(scored: &[(u16, f64)]) -> Vec<u16> {
+/// then every candidate within `max(TIE_EPS, margin)` of it, in mcc_idx order.
+/// `margin` = 0 keeps exact ties only; a positive margin hands near-ties to
+/// the EM instead of letting a marginal score difference decide.
+pub(crate) fn select_best_mcc_indices(scored: &[(u32, f64)], margin: f64) -> Vec<u32> {
     // Take the true maximum first, then collect every candidate within TIE_EPS
     // of it. The previous single running-max pass was order dependent: "within
     // TIE_EPS" is not transitive, so a candidate that ties against one anchor is
@@ -459,6 +595,7 @@ pub(crate) fn select_best_mcc_indices(scored: &[(u16, f64)]) -> Vec<u16> {
     // iteration happened to visit first. Two passes make the winner set a
     // function of the scores alone, and its order is mcc_idx ascending.
     const TIE_EPS: f64 = 1e-6;
+    let tol = margin.max(TIE_EPS);
     let max_score = scored
         .iter()
         .map(|&(_, score)| score)
@@ -470,7 +607,7 @@ pub(crate) fn select_best_mcc_indices(scored: &[(u16, f64)]) -> Vec<u16> {
     }
     scored
         .iter()
-        .filter(|&&(_, score)| score != f64::NEG_INFINITY && (max_score - score) <= TIE_EPS)
+        .filter(|&&(_, score)| score != f64::NEG_INFINITY && (max_score - score) <= tol)
         .map(|&(mcc_idx, _)| mcc_idx)
         .collect()
 }

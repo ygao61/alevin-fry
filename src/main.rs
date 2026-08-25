@@ -46,6 +46,15 @@ fn gen_random_kmer(k: usize) -> String {
 
 #[allow(clippy::manual_clamp)]
 fn main() -> anyhow::Result<()> {
+    // A panic in a worker thread must never leave a partially written output
+    // directory with a zero exit status: print the panic as usual, then abort
+    // the whole process (non-zero exit, no quant.json).
+    let default_panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_panic_hook(info);
+        eprintln!("fatal: a thread panicked; aborting so no partial output is mistaken for a result");
+        std::process::abort();
+    }));
     let num_hardware_threads = num_cpus::get() as u32;
     let max_num_threads: String = (num_cpus::get() as u32).to_string();
     let max_num_collate_threads: String = (16_u32.min(num_hardware_threads).max(2_u32)).to_string();
@@ -202,6 +211,10 @@ fn main() -> anyhow::Result<()> {
     .arg(arg!(--"max-frag-len" <MAXFRAGLEN> "the maximum fragment length to consider for splicing ambiguity resolution")
         .value_parser(value_parser!(u16))
         .default_value("1000")
+        .hide(true))
+    .arg(arg!(--"forseti-margin" <MARGIN> "forseti: keep every candidate whose score is within MARGIN of the best as a co-winner (mean log-probability per alignment; 0 = exact ties only), leaving the choice to the EM")
+        .value_parser(value_parser!(f64))
+        .default_value("0")
         .hide(true));
 
     let infer_app = Command::new("infer")
@@ -427,6 +440,7 @@ fn main() -> anyhow::Result<()> {
         let sa_model = *t.get_one::<SplicedAmbiguityModel>("sa-model").unwrap();
         let small_thresh = *t.get_one("small-thresh").unwrap();
         let max_frag_len = *t.get_one("max-frag-len").unwrap();
+        let forseti_margin: f64 = *t.get_one("forseti-margin").unwrap();
         let filter_list: Option<&PathBuf> = t.get_one("quant-subset");
         let large_graph_thresh: usize = *t.get_one("large-graph-thresh").unwrap();
         let umi_edit_dist: u32 = *t.get_one("umi-edit-dist").unwrap();
@@ -545,6 +559,7 @@ fn main() -> anyhow::Result<()> {
             .small_thresh(small_thresh)
             .large_graph_thresh(large_graph_thresh)
             .max_frag_len(max_frag_len)
+            .forseti_margin(forseti_margin)
             .filter_list(filter_list)
             .pug_exact_umi(pug_exact_umi)
             .spliceu_fa(spliceu_fa)

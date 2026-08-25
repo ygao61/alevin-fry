@@ -62,12 +62,31 @@ impl FaiSeqStore {
             s.push(".fai");
             std::path::PathBuf::from(s)
         };
+        if fasta.extension().is_some_and(|e| e.eq_ignore_ascii_case("gz")) {
+            bail!(
+                "{:?} looks gzip-compressed; forseti reads transcript sequence by byte offset \
+                 through the .fai index, which needs the uncompressed FASTA",
+                fasta
+            );
+        }
         let fai = std::fs::read_to_string(&fai_path).with_context(|| {
             format!(
                 "could not read the FASTA index {:?}; create it with `samtools faidx {:?}`",
                 fai_path, fasta
             )
         })?;
+        // A .fai older than its FASTA describes some other file: offsets would
+        // silently read wrong bytes.
+        if let (Ok(fm), Ok(im)) = (std::fs::metadata(fasta), std::fs::metadata(&fai_path)) {
+            if let (Ok(ft), Ok(it)) = (fm.modified(), im.modified()) {
+                if ft > it {
+                    bail!(
+                        "{:?} is newer than its index {:?}; rebuild the index with `samtools faidx {:?}`",
+                        fasta, fai_path, fasta
+                    );
+                }
+            }
+        }
         let name_to_id: HashMap<&str, usize> = ref_names
             .iter()
             .enumerate()
@@ -89,7 +108,8 @@ impl FaiSeqStore {
             let offset = parse(it.next(), "offset")?;
             let linebases = parse(it.next(), "linebases")?;
             let linewidth = parse(it.next(), "linewidth")?;
-            if linebases == 0 || linewidth < linebases {
+            // samtools writes linebases = linewidth = 0 for an empty record
+            if (linebases == 0 && len > 0) || linewidth < linebases {
                 bail!("{:?} line {}: invalid line geometry", fai_path, ln + 1);
             }
             if let Some(&id) = name_to_id.get(name) {
@@ -109,6 +129,17 @@ impl FaiSeqStore {
     /// Number of RAD references that have a FASTA record.
     pub fn n_present(&self) -> usize {
         self.n_present
+    }
+
+    /// Up to `limit` names of RAD references without a FASTA record.
+    pub fn missing_names(&self, ref_names: &[String], limit: usize) -> Vec<String> {
+        self.recs
+            .iter()
+            .zip(ref_names)
+            .filter(|(r, _)| r.is_none())
+            .map(|(_, n)| n.clone())
+            .take(limit)
+            .collect()
     }
 }
 

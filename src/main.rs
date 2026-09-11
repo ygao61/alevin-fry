@@ -651,6 +651,7 @@ fn main() -> anyhow::Result<()> {
         let large_graph_thresh: usize = *t.get_one("large-graph-thresh").unwrap();
         let umi_edit_dist: u32 = *t.get_one("umi-edit-dist").unwrap();
         let mut pug_exact_umi = false;
+        let mut crlike_umi_edit: u32 = 0;
 
         match umi_edit_dist {
             0 => {
@@ -671,10 +672,12 @@ fn main() -> anyhow::Result<()> {
             }
             1 => {
                 match resolution {
-                    ResolutionStrategy::Trivial
-                    | ResolutionStrategy::CellRangerLike
-                    | ResolutionStrategy::CellRangerLikeEm => {
-                        // these methods don't currently support 1 edit UMIs
+                    ResolutionStrategy::CellRangerLike | ResolutionStrategy::CellRangerLikeEm => {
+                        // PATCH (Yuan 2026-08-26): Cell Ranger-style Hamming-1 UMI correction
+                        // per (cell, gene) before winner-take-all resolution.
+                        crlike_umi_edit = 1;
+                    }
+                    ResolutionStrategy::Trivial => {
                         crit!(
                             log,
                             "\n\nResolution strategy {:?} doesn't currently support 1-edit UMI resolution",
@@ -749,6 +752,7 @@ fn main() -> anyhow::Result<()> {
             .large_graph_thresh(large_graph_thresh)
             .filter_list(filter_list)
             .pug_exact_umi(pug_exact_umi)
+            .crlike_umi_edit(crlike_umi_edit)
             .cmdline(&cmdline)
             .version(VERSION)
             .log(&log)

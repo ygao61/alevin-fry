@@ -402,6 +402,7 @@ struct WorkerConfig {
     em_init_type: EmInitType,
     large_graph_thresh: usize,
     pug_exact_umi: bool,
+    crlike_umi_edit: u32,
     sa_model: SplicedAmbiguityModel,
     num_bootstraps: u32,
     init_uniform: bool,
@@ -865,6 +866,7 @@ where
                                     config.num_genes,
                                     &mut gene_eqc,
                                     config.sa_model,
+                                    config.crlike_umi_edit,
                                     &log,
                                 );
                             } else {
@@ -875,6 +877,7 @@ where
                                     config.num_genes,
                                     &mut gene_eqc,
                                     config.sa_model,
+                                    config.crlike_umi_edit,
                                     &log,
                                 );
                                 eq_map.clear();
@@ -1054,6 +1057,7 @@ where
                         config.num_genes,
                         &mut gene_eqc,
                         config.sa_model,
+                        config.crlike_umi_edit,
                         &log,
                     );
                     // USA-mode
@@ -1377,6 +1381,7 @@ where
     let dump_eq = quant_opts.dump_eq;
     let resolution = quant_opts.resolution;
     let pug_exact_umi = quant_opts.pug_exact_umi;
+    let crlike_umi_edit = quant_opts.crlike_umi_edit;
     let mut sa_model = quant_opts.sa_model;
     let tiny_cell_thresh = quant_opts.small_thresh;
     let large_graph_thresh = quant_opts.large_graph_thresh;
@@ -1730,6 +1735,7 @@ where
             },
             large_graph_thresh,
             pug_exact_umi,
+            crlike_umi_edit,
             sa_model,
             num_bootstraps,
             init_uniform,

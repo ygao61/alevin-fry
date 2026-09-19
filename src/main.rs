@@ -343,7 +343,7 @@ fn main() -> anyhow::Result<()> {
     .arg(arg!(--"small-thresh" <SMALLTHRESH> "cells with fewer than this many reads are resolved by a fast path that applies cr-like (winner-take-all) semantics regardless of --resolution; pass 0 to resolve every cell with the requested strategy")
         .value_parser(value_parser!(usize))
         .default_value("100"))
-    .arg(arg!(--"probe-mtx" "also write a probe (reference target) x cell count matrix (alevin/probe_quants_mat.mtx) in the same pass (cr-like, cr-like-em, trivial, parsimony, parsimony-em). Each probe is resolved as its own feature, so the probe counts of a gene need not sum to its gene count. The probe matrix is never split by splicing status: with a 3-column (USA) tg-map it still has one column per probe, and a warning is printed"))
+    .arg(arg!(--"probe-mtx" "also write a probe (reference target) x cell count matrix (alevin/probe_quants_mat.mtx) in the same pass (not with parsimony-gene / parsimony-gene-em; use parsimony / parsimony-em). Each probe is resolved as its own feature, so the probe counts of a gene need not sum to its gene count. The probe matrix is never split by splicing status: with a 3-column (USA) tg-map it still has one column per probe, and a warning is printed"))
     // Multi-sample output option (for multi-barcode RAD files)
     .arg(arg!(--"multi-sample-output" <MSOUTPUT> "output mode for multi-sample data: separate per-sample matrices, one combined matrix, or both")
         .value_parser(["separate", "combined", "both"])
@@ -723,22 +723,24 @@ fn main() -> anyhow::Result<()> {
         }
 
         let probe_mtx = t.get_flag("probe-mtx");
-        if probe_mtx
-            && !matches!(
-                resolution,
-                ResolutionStrategy::CellRangerLike
-                    | ResolutionStrategy::CellRangerLikeEm
-                    | ResolutionStrategy::Trivial
-                    | ResolutionStrategy::Parsimony
-                    | ResolutionStrategy::ParsimonyEm
-            )
-        {
-            crit!(
-                log,
-                "\n\n--probe-mtx is not supported with --resolution {:?}",
-                resolution
-            );
-            bail!("Invalid command line option");
+        // parsimony-gene(-em) project reads to genes before building the UMI
+        // graph, so no per-probe assignment exists; parsimony(-em) is their
+        // probe-level counterpart.
+        if probe_mtx {
+            let rejected = match resolution {
+                ResolutionStrategy::ParsimonyGene => Some(("parsimony-gene", "parsimony")),
+                ResolutionStrategy::ParsimonyGeneEm => Some(("parsimony-gene-em", "parsimony-em")),
+                _ => None,
+            };
+            if let Some((name, counterpart)) = rejected {
+                crit!(
+                    log,
+                    "\n\n--probe-mtx is not supported with --resolution {}: it projects reads to genes before building the UMI graph (gene-level equivalence classes), so no per-probe assignment exists. Use --resolution {}, its probe-level counterpart, to get a probe matrix.",
+                    name,
+                    counterpart
+                );
+                bail!("Invalid command line option");
+            }
         }
 
         if dump_eq && (resolution == ResolutionStrategy::Trivial) {

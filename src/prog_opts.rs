@@ -37,6 +37,9 @@ pub struct QuantOpts<'a, 'b, 'c, 'd, 'e, 'f, 'g> {
     /// cr-like only: collapse UMIs within Hamming distance 1 of a higher-count UMI (same cell, same gene)
     #[builder(default = 0)]
     pub crlike_umi_edit: u32,
+    /// cr-like only: also write a probe (reference target) x cell matrix in the same pass
+    #[builder(default = false)]
+    pub probe_mtx: bool,
     pub sa_model: SplicedAmbiguityModel,
     pub small_thresh: usize,
     pub large_graph_thresh: usize,

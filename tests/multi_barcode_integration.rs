@@ -1544,3 +1544,239 @@ fn tiny_cell_fast_path_does_not_override_requested_resolution() {
         em_full_mass
     );
 }
+
+// -----------------------------------------------------------------------
+// --probe-mtx
+// -----------------------------------------------------------------------
+
+/// Read an alevin MTX (`<prefix>quants_mat.mtx` + `<prefix>quants_mat_cols.txt`,
+/// rows from `quants_mat_rows.txt`) into `(row label, column label) -> value`.
+fn read_labeled_mtx(
+    alevin_dir: &Path,
+    prefix: &str,
+) -> std::collections::BTreeMap<(String, String), f64> {
+    let lines = |name: &str| -> Vec<String> {
+        std::fs::read_to_string(alevin_dir.join(name))
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    };
+    let rows = lines("quants_mat_rows.txt");
+    let cols = lines(&format!("{prefix}quants_mat_cols.txt"));
+    let mtx = std::fs::read_to_string(alevin_dir.join(format!("{prefix}quants_mat.mtx"))).unwrap();
+    let mut body = mtx.lines().filter(|l| !l.starts_with('%'));
+    let dims: Vec<usize> = body
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .map(|x| x.parse().unwrap())
+        .collect();
+    assert_eq!((dims[0], dims[1]), (rows.len(), cols.len()));
+    let mut out = std::collections::BTreeMap::new();
+    for l in body {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        let (r, c): (usize, usize) = (f[0].parse().unwrap(), f[1].parse().unwrap());
+        let v: f64 = f[2].parse().unwrap();
+        out.insert((rows[r - 1].clone(), cols[c - 1].clone()), v);
+    }
+    assert_eq!(out.len(), dims[2]);
+    out
+}
+
+/// One sample, three cells sized to take the tiny (< 100 reads), small
+/// (<= 250) and large cr-like paths. Reference `gene_i` belongs to gene
+/// `G{i/2}`, so every gene has two probes. Reads draw UMIs from a small pool
+/// (multi-read UMIs), sometimes one base away from a pool UMI (Hamming-1
+/// neighbours), and sometimes hit both probes of a gene or two genes.
+fn create_probe_level_rad(path: &Path, sample_bc: u64, cell_sizes: &[usize]) -> anyhow::Result<()> {
+    let (prelude, file_tag_map) = make_multi_bc_prelude();
+    let ctx = MultiBarcodeRecordContext::get_context_from_tag_section(
+        &prelude.file_tags,
+        &prelude.read_tags,
+        &prelude.aln_tags,
+    )?;
+    let mut fw = RadFileWriter::new(File::create(path)?, &prelude, &file_tag_map)?;
+    let mut state = 12345u64;
+    let mut rng = move || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        state >> 33
+    };
+    for (cell_idx, &n) in cell_sizes.iter().enumerate() {
+        let cell_bc = make_packed_bc(cell_idx as u64 + 1, CELL_BC_LEN);
+        let pool = (n / 3).max(2) as u64;
+        let mut reads = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut umi = make_packed_bc(1000 * (cell_idx as u64 + 1) + rng() % pool, UMI_LEN);
+            if rng() % 5 == 0 {
+                let pos = rng() % UMI_LEN as u64;
+                umi ^= (1 + rng() % 3) << (2 * pos);
+            }
+            let p = (rng() % NUM_REFS) as u32;
+            let refs = match rng() % 6 {
+                0 => vec![p & !1, p | 1],
+                1 => {
+                    let q = (p + 2) % NUM_REFS as u32;
+                    vec![p.min(q), p.max(q)]
+                }
+                _ => vec![p],
+            };
+            reads.push(MultiBarcodeReadRecord {
+                barcodes: smallvec![sample_bc, cell_bc],
+                umi,
+                dirs: vec![true; refs.len()],
+                refs,
+            });
+        }
+        let chunk = Chunk::<MultiBarcodeReadRecord> {
+            nbytes: 0,
+            nrec: reads.len() as u32,
+            reads,
+        };
+        fw.write_chunk(&chunk, &ctx)?;
+    }
+    fw.finalize()?;
+    Ok(())
+}
+
+/// `--probe-mtx` must (a) leave the gene matrix unchanged and (b) produce
+/// exactly the matrix of a separate quant whose t2g maps every probe to itself,
+/// on all three cr-like paths, with and without Hamming-1 UMI correction.
+#[test]
+fn probe_mtx_matches_identity_t2g_quant_and_leaves_gene_matrix_unchanged() {
+    use alevin_fry::cellfilter::{CellFilterMethod, generate_permit_list};
+    use alevin_fry::collate::collate;
+    use alevin_fry::prog_opts::{GenPermitListOpts, QuantOpts, SampleCorrectionMode};
+    use alevin_fry::quant::{ResolutionStrategy, SplicedAmbiguityModel, quantify};
+    use bio_types::strand::Strand;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let rad_dir = tmp.path().join("rad");
+    std::fs::create_dir_all(&rad_dir).unwrap();
+    let gpl_dir = tmp.path().join("gpl");
+    std::fs::create_dir_all(&gpl_dir).unwrap();
+
+    let sample_bc = make_packed_bc(100, SAMPLE_BC_LEN);
+    let cell_sizes = [60, 180, 400];
+    create_probe_level_rad(&rad_dir.join("map.rad"), sample_bc, &cell_sizes).unwrap();
+    let sample_list = tmp.path().join("sample_barcodes.tsv");
+    write_named_sample_bc_list(&sample_list, &[("s", sample_bc)], SAMPLE_BC_LEN).unwrap();
+
+    let gene_t2g = tmp.path().join("gene_t2g.tsv");
+    let probe_t2g = tmp.path().join("probe_t2g.tsv");
+    {
+        let mut g = BufWriter::new(File::create(&gene_t2g).unwrap());
+        let mut p = BufWriter::new(File::create(&probe_t2g).unwrap());
+        for i in 0..NUM_REFS {
+            writeln!(g, "gene_{}\tG{}", i, i / 2).unwrap();
+            writeln!(p, "gene_{}\tgene_{}", i, i).unwrap();
+        }
+    }
+
+    let log = make_test_logger();
+    let gpl_opts = GenPermitListOpts::builder()
+        .input_dir(&rad_dir)
+        .output_dir(&gpl_dir)
+        .fmeth(CellFilterMethod::ForceCells(cell_sizes.len()))
+        .expected_ori(Strand::Unknown)
+        .version(TEST_VERSION)
+        .threads(2)
+        .velo_mode(false)
+        .cmdline("test")
+        .log(&log)
+        .sample_bc_list(Some(sample_list))
+        .sample_names(None)
+        .sample_correction_mode(SampleCorrectionMode::Exact)
+        .build();
+    generate_permit_list(gpl_opts).unwrap();
+    collate(
+        gpl_dir.clone(),
+        &rad_dir,
+        2,
+        1_000,
+        ChunkCodec::None,
+        "test",
+        TEST_VERSION,
+        &log,
+    )
+    .unwrap();
+
+    let run = |name: &str,
+               t2g: &std::path::PathBuf,
+               umi_edit: u32,
+               probe_mtx: bool|
+     -> std::path::PathBuf {
+        let out = tmp.path().join(name);
+        let quant_opts = QuantOpts::builder()
+            .input_dir(&gpl_dir)
+            .tg_map(t2g)
+            .output_dir(&out)
+            .num_threads(2)
+            .num_bootstraps(0)
+            .init_uniform(false)
+            .summary_stat(false)
+            .dump_eq(false)
+            .resolution(ResolutionStrategy::CellRangerLike)
+            .pug_exact_umi(false)
+            .crlike_umi_edit(umi_edit)
+            .probe_mtx(probe_mtx)
+            .sa_model(SplicedAmbiguityModel::WinnerTakeAll)
+            .small_thresh(100)
+            .large_graph_thresh(0)
+            .filter_list(None)
+            .cmdline("test")
+            .version(TEST_VERSION)
+            .log(&log)
+            .build();
+        quantify(quant_opts).unwrap();
+        out.join("alevin")
+    };
+
+    let mut probe_sum_differs_from_gene = false;
+    for umi_edit in [0u32, 1] {
+        let with_flag = run(
+            &format!("with_flag_ed{umi_edit}"),
+            &gene_t2g,
+            umi_edit,
+            true,
+        );
+        let gene_only = run(&format!("gene_ed{umi_edit}"), &gene_t2g, umi_edit, false);
+        let identity = run(
+            &format!("identity_ed{umi_edit}"),
+            &probe_t2g,
+            umi_edit,
+            false,
+        );
+
+        let gene = read_labeled_mtx(&with_flag, "");
+        assert_eq!(
+            gene,
+            read_labeled_mtx(&gene_only, ""),
+            "ed{umi_edit}: gene matrix changed"
+        );
+        let probe = read_labeled_mtx(&with_flag, "probe_");
+        assert!(!probe.is_empty());
+        assert_eq!(
+            probe,
+            read_labeled_mtx(&identity, ""),
+            "ed{umi_edit}: probe matrix differs from the identity-t2g quant"
+        );
+        let probe_cols =
+            std::fs::read_to_string(with_flag.join("probe_quants_mat_cols.txt")).unwrap();
+        let expected: Vec<String> = (0..NUM_REFS).map(|i| format!("gene_{i}")).collect();
+        assert_eq!(probe_cols.lines().collect::<Vec<_>>(), expected);
+
+        let mut summed = std::collections::BTreeMap::new();
+        for ((row, col), v) in &probe {
+            let i: u64 = col.trim_start_matches("gene_").parse().unwrap();
+            *summed
+                .entry((row.clone(), format!("G{}", i / 2)))
+                .or_insert(0.0) += v;
+        }
+        probe_sum_differs_from_gene |= summed != gene;
+    }
+    // The fixture must exercise the per-probe semantics, not just trivially agree.
+    assert!(probe_sum_differs_from_gene);
+}

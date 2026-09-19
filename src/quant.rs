@@ -411,6 +411,9 @@ struct WorkerConfig {
     tiny_cell_thresh: usize,
 }
 
+/// Identity target map and probe x cell matrix writer for `--probe-mtx`.
+type ProbeOutput = (Arc<Vec<u32>>, Arc<Mutex<MatrixMarketWriter<File>>>);
+
 struct WorkerSharedState<R: MappedRecord> {
     /// This worker's own drain-safe view of the producer's meta-chunk queue.
     /// One per thread: `MetaChunkStream::next` takes `&mut self`, and sharing a
@@ -423,6 +426,9 @@ struct WorkerSharedState<R: MappedRecord> {
     /// feature critical section, and vice-versa.
     matrix_out: Arc<Mutex<MatrixMarketWriter<File>>>,
     bootstrap_out: Option<Arc<BootstrapOutput>>,
+    /// `--probe-mtx`: the identity target map and the probe x cell matrix
+    /// writer (rows shared with `matrix_out`).
+    probe_out: Option<ProbeOutput>,
     output_failed: Arc<AtomicBool>,
     eqid_map_lock: Arc<Mutex<EqcMap>>,
     alt_res_cells: Arc<Mutex<Vec<u64>>>,
@@ -656,6 +662,126 @@ fn quantify_small_cell_sparse<B, R>(
     gene_umi_buf.sort_unstable();
 }
 
+/// Per-worker state for the optional probe x cell matrix (`--probe-mtx`).
+///
+/// Each cell is resolved a second time with the identity map in place of
+/// `tid_to_gid`, i.e. every reference target (probe) is its own feature. The
+/// cell takes the same path (tiny / small / large) that a gene-level quant with
+/// an identity t2g would take, so the output equals such a quant exactly.
+/// UMI correction, deduplication and the winner-take-all tie drop therefore act
+/// per probe: a gene's probe counts need not sum to its gene count.
+///
+/// Always resolved without splicing status: in USA mode the gene matrix has
+/// S/U/A columns, but a probe's region is fixed, so the probe matrix keeps one
+/// column per probe (a warning is logged for that combination). Columns are in
+/// reference-id (RAD header) order, written to `probe_quants_mat_cols.txt`;
+/// rows are shared with the gene matrix.
+struct ProbeResolver<P: EqClassPayload> {
+    identity: Arc<Vec<u32>>,
+    eqc: HashMap<Vec<u32>, P, ahash::RandomState>,
+    scratch: pugutils::CrLikeScratch,
+    probe_umi_buf: Vec<(u32, u64)>,
+    /// This cell's non-zero `(probe index, count)` entries, sorted by index.
+    entries: Vec<(usize, f32)>,
+    batch: MatrixBatch,
+}
+
+impl<P: EqClassPayload> ProbeResolver<P> {
+    fn new(identity: Arc<Vec<u32>>) -> Self {
+        let s = ahash::RandomState::with_seeds(2u64, 7u64, 1u64, 8u64);
+        Self {
+            identity,
+            eqc: HashMap::with_hasher(s),
+            scratch: pugutils::CrLikeScratch::default(),
+            probe_umi_buf: Vec::new(),
+            entries: Vec::new(),
+            batch: MatrixBatch::default(),
+        }
+    }
+
+    /// Resolve one cell at probe level into `self.entries`. Only reads the
+    /// chunk's records; `eq_map` is used as scratch and left cleared.
+    fn resolve<B, R>(
+        &mut self,
+        c: &mut libradicl::chunk::Chunk<R>,
+        config: &WorkerConfig,
+        eq_map: &mut EqMap,
+        umi_gene_triplets: &mut Vec<(u64, u32, u32)>,
+        log: &slog::Logger,
+    ) where
+        B: ConvertiblePrimitiveInteger,
+        u64: From<B>,
+        R: MappedRecord
+            + CollatableMappedRecord<B>
+            + KnownSize
+            + UmiTaggedRecord
+            + OptionalAlignmentExtras
+            + 'static,
+        <R as MappedRecord>::ParsingContext: RecordContext,
+        <R as MappedRecord>::ParsingContext: Clone,
+        <R as MappedRecord>::ParsingContext: Send,
+    {
+        self.entries.clear();
+        let num_probes = self.identity.len();
+        if c.reads.len() < config.tiny_cell_thresh {
+            quantify_small_cell_sparse::<B, R>(
+                c,
+                &self.identity,
+                false,
+                num_probes,
+                &mut self.probe_umi_buf,
+                umi_gene_triplets,
+            );
+            // probe_umi_buf is sorted by probe; run-length count it.
+            for &(pid, _) in self.probe_umi_buf.iter() {
+                match self.entries.last_mut() {
+                    Some((last, ct)) if *last == pid as usize => *ct += 1.0,
+                    _ => self.entries.push((pid as usize, 1.0)),
+                }
+            }
+            return;
+        }
+        self.eqc.clear();
+        if c.reads.len() <= 250 {
+            pugutils::get_num_molecules_cell_ranger_like_small::<B, R, P>(
+                c,
+                &self.identity,
+                num_probes,
+                &mut self.eqc,
+                SplicedAmbiguityModel::WinnerTakeAll,
+                &mut self.scratch,
+                config.crlike_umi_edit,
+                config.umi_len,
+                true,
+                log,
+            );
+        } else {
+            eq_map.init_from_chunk::<R>(c);
+            pugutils::get_num_molecules_cell_ranger_like(
+                eq_map,
+                &self.identity,
+                num_probes,
+                &mut self.eqc,
+                SplicedAmbiguityModel::WinnerTakeAll,
+                &mut self.scratch,
+                config.crlike_umi_edit,
+                config.umi_len,
+                true,
+                log,
+            );
+            eq_map.clear();
+        }
+        // cr-like keeps only single-probe labels (as em_optimize with
+        // only_unique); multi-probe labels are ties and are dropped.
+        for (labels, payload) in self.eqc.iter() {
+            if let [pid] = labels.as_slice() {
+                self.entries.push((*pid as usize, payload.count() as f32));
+            }
+        }
+        self.entries.sort_unstable_by_key(|e| e.0);
+    }
+}
+
 fn run_worker_thread<B, R, P>(
     _worker_num: usize,
     config: WorkerConfig,
@@ -725,6 +851,11 @@ where
     // Reusable working buffers for the cr-like resolvers, carried across cells
     // to avoid a fresh allocation per cell / per equivalence class.
     let mut crlike_scratch = pugutils::CrLikeScratch::default();
+
+    let mut probe_resolver: Option<ProbeResolver<P>> = shared
+        .probe_out
+        .as_ref()
+        .map(|(identity, _)| ProbeResolver::new(identity.clone()));
 
     let mut local_nrec = 0usize;
     // Drain MetaChunks until the producer is done and the queue is empty.
@@ -1147,6 +1278,10 @@ where
                 } // end of else branch for trivial size cells
             } // end of else block for non-fast-path cells
 
+            if let Some(pr) = probe_resolver.as_mut() {
+                pr.resolve::<B, R>(&mut c, &config, &mut eq_map, &mut umi_gene_triplets, &log);
+            }
+
             if alt_resolution {
                 shared.alt_res_cells.lock().unwrap().push(cell_num as u64);
             }
@@ -1271,6 +1406,15 @@ where
                         .record_cell(row_index, &bootstraps, output)
                         .context("could not write bootstrap matrices")?;
                 }
+                if let (Some(pr), Some((_, probe_matrix))) =
+                    (probe_resolver.as_mut(), &shared.probe_out)
+                {
+                    for &(ind, val) in pr.entries.iter() {
+                        pr.batch
+                            .push(row_index, ind, val, probe_matrix)
+                            .context("could not write probe count matrix")?;
+                    }
+                }
                 Ok(row_index)
             })();
             let row_index = match cell_output {
@@ -1335,6 +1479,13 @@ where
                 boot_helper
                     .flush(output)
                     .context("could not flush bootstrap batches")?;
+            }
+            if let (Some(pr), Some((_, probe_matrix))) =
+                (probe_resolver.as_mut(), &shared.probe_out)
+            {
+                pr.batch
+                    .flush(probe_matrix)
+                    .context("could not flush probe count matrix batch")?;
             }
             Ok(())
         })();
@@ -1742,6 +1893,12 @@ where
                         "--umi-edit-dist 1 (cr-like Hamming-1 UMI correction) is not supported in USA mode (a spliced+unspliced tg-map); it is only meaningful for a spliced-only reference"
                     );
                 }
+                if quant_opts.probe_mtx {
+                    warn!(
+                        log,
+                        "--probe-mtx with a USA-mode (3-column) tg-map: the gene matrix has spliced/unspliced/ambiguous columns, but the probe matrix is always non-USA (one column per probe; a probe's splicing region is fixed by the probe set)."
+                    );
+                }
                 assert_eq!(
                     num_bootstraps, 0,
                     "currently USA-mode (all-in-one unspliced/spliced/ambiguous) analysis cannot be used with bootstrapping."
@@ -1993,6 +2150,23 @@ where
     } else {
         None
     };
+    let probe_out = if quant_opts.probe_mtx {
+        let num_probes = hdr.ref_count as usize;
+        let path = output_matrix_path.join("probe_quants_mat.mtx");
+        let file =
+            File::create(&path).with_context(|| format!("could not create {}", path.display()))?;
+        let identity: Vec<u32> = (0..num_probes as u32).collect();
+        Some((
+            Arc::new(identity),
+            Arc::new(Mutex::new(MatrixMarketWriter::new(
+                file,
+                num_cells as usize,
+                num_probes,
+            )?)),
+        ))
+    } else {
+        None
+    };
     let output_failed = Arc::new(AtomicBool::new(false));
 
     type WorkerResult = anyhow::Result<usize>;
@@ -2025,6 +2199,7 @@ where
         // and the streaming count-matrix writer
         let matrix_out = matrix_out.clone();
         let bootstrap_out = bootstrap_out.clone();
+        let probe_out = probe_out.clone();
         let output_failed = output_failed.clone();
         // global gene-level eqc map
         let eqid_map_lockc = eqid_map_lock.clone();
@@ -2087,6 +2262,7 @@ where
             bcout,
             matrix_out,
             bootstrap_out,
+            probe_out,
             output_failed,
             eqid_map_lock: eqid_map_lockc,
             alt_res_cells,
@@ -2253,6 +2429,30 @@ where
         }
     }
 
+    let probe_nnz = if let Some((_, probe_matrix)) = probe_out {
+        let nnz = Arc::try_unwrap(probe_matrix)
+            .map_err(|_| anyhow::anyhow!("probe count matrix is still held by a worker"))?
+            .into_inner()
+            .map_err(|_| anyhow::anyhow!("probe count matrix output lock was poisoned"))?
+            .finish()
+            .context("could not finalize probe count matrix")?;
+        info!(
+            log,
+            "wrote probe count matrix: {} nonzeros",
+            nnz.to_formatted_string(&Locale::en)
+        );
+        let pn_path = output_matrix_path.join("probe_quants_mat_cols.txt");
+        let mut pn_writer =
+            BufWriter::new(File::create(pn_path).context("could not create probe name output")?);
+        for n in hdr.ref_names.iter() {
+            writeln!(pn_writer, "{}", n)?;
+        }
+        pn_writer.flush()?;
+        Some(nnz)
+    } else {
+        None
+    };
+
     let gn_path = output_matrix_path.join("quants_mat_cols.txt");
     let gn_file = File::create(gn_path).context("could not create gene name output")?;
     let mut gn_writer = BufWriter::new(gn_file);
@@ -2326,6 +2526,9 @@ where
     "empty_resolved_cell_numbers" : *empty_resolved_cells.lock().unwrap(),
     "num_tiny_cell_resolved" : tiny_cell_resolved.len(),
     "tiny_cell_resolved_cell_numbers" : tiny_cell_resolved,
+    "probe_mtx" : quant_opts.probe_mtx,
+    "num_probes" : quant_opts.probe_mtx.then_some(hdr.ref_count),
+    "probe_nnz" : probe_nnz,
     "quant_options" : quant_opts
     });
 

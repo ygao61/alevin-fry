@@ -1736,6 +1736,7 @@ fn probe_mtx_matches_identity_t2g_quant_and_leaves_gene_matrix_unchanged() {
                t2g: &std::path::PathBuf,
                resolution: ResolutionStrategy,
                umi_edit: u32,
+               large_graph_thresh: usize,
                probe_mtx: bool|
      -> std::path::PathBuf {
         let out = tmp.path().join(name);
@@ -1754,7 +1755,7 @@ fn probe_mtx_matches_identity_t2g_quant_and_leaves_gene_matrix_unchanged() {
             .probe_mtx(probe_mtx)
             .sa_model(SplicedAmbiguityModel::WinnerTakeAll)
             .small_thresh(100)
-            .large_graph_thresh(0)
+            .large_graph_thresh(large_graph_thresh)
             .filter_list(None)
             .cmdline("test")
             .version(TEST_VERSION)
@@ -1764,21 +1765,45 @@ fn probe_mtx_matches_identity_t2g_quant_and_leaves_gene_matrix_unchanged() {
         out.join("alevin")
     };
 
+    // (resolution, cr-like UMI edit distance, parsimony large-graph threshold);
+    // a threshold of 0 sends every multi-vertex parsimony component to the
+    // large-component fallback.
     let cases = [
-        (ResolutionStrategy::CellRangerLike, 0u32),
-        (ResolutionStrategy::CellRangerLike, 1),
-        (ResolutionStrategy::CellRangerLikeEm, 0),
-        (ResolutionStrategy::CellRangerLikeEm, 1),
-        (ResolutionStrategy::Trivial, 0),
+        (ResolutionStrategy::CellRangerLike, 0u32, 0usize),
+        (ResolutionStrategy::CellRangerLike, 1, 0),
+        (ResolutionStrategy::CellRangerLikeEm, 0, 0),
+        (ResolutionStrategy::CellRangerLikeEm, 1, 0),
+        (ResolutionStrategy::Trivial, 0, 0),
+        (ResolutionStrategy::Parsimony, 0, 1000),
+        (ResolutionStrategy::Parsimony, 0, 0),
+        (ResolutionStrategy::ParsimonyEm, 0, 1000),
+        (ResolutionStrategy::ParsimonyEm, 0, 0),
     ];
     let mut probe_sum_differs_from_gene = false;
-    for (res, umi_edit) in cases {
-        let tag = format!("{res:?}_ed{umi_edit}");
-        let with_flag = run(&format!("with_flag_{tag}"), &gene_t2g, res, umi_edit, true);
-        let gene_only = run(&format!("gene_{tag}"), &gene_t2g, res, umi_edit, false);
-        let identity = run(&format!("identity_{tag}"), &probe_t2g, res, umi_edit, false);
+    for (res, umi_edit, lgt) in cases {
+        let tag = format!("{res:?}_ed{umi_edit}_lgt{lgt}");
+        let with_flag = run(
+            &format!("with_flag_{tag}"),
+            &gene_t2g,
+            res,
+            umi_edit,
+            lgt,
+            true,
+        );
+        let gene_only = run(&format!("gene_{tag}"), &gene_t2g, res, umi_edit, lgt, false);
+        let identity = run(
+            &format!("identity_{tag}"),
+            &probe_t2g,
+            res,
+            umi_edit,
+            lgt,
+            false,
+        );
 
-        let exact = res != ResolutionStrategy::CellRangerLikeEm;
+        let exact = !matches!(
+            res,
+            ResolutionStrategy::CellRangerLikeEm | ResolutionStrategy::ParsimonyEm
+        );
         let gene = read_labeled_mtx(&with_flag, "");
         assert_mtx_match(
             &gene,

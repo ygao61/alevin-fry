@@ -687,6 +687,8 @@ struct ProbeResolver<P: EqClassPayload> {
     /// EM evidence buffers over the probe axis (the gene path keeps its own).
     unique_evidence: Vec<bool>,
     no_ambiguity: Vec<bool>,
+    /// Whether the current cell takes the tiny-cell fast path at probe level.
+    tiny: bool,
 }
 
 impl<P: EqClassPayload> ProbeResolver<P> {
@@ -701,7 +703,21 @@ impl<P: EqClassPayload> ProbeResolver<P> {
             unique_evidence: vec![false; identity.len()],
             no_ambiguity: vec![false; identity.len()],
             identity,
+            tiny: false,
         }
+    }
+
+    /// Reset per-cell state before the gene-level pass. For `parsimony` the gene
+    /// pass fills `eqc` (see `pugutils::get_num_molecules`), unless the cell is tiny.
+    fn begin_cell(&mut self, num_reads: usize, config: &WorkerConfig) {
+        self.entries.clear();
+        self.eqc.clear();
+        self.tiny = num_reads < config.tiny_cell_thresh;
+    }
+
+    /// Target-level sink for the gene pass of `parsimony` / `parsimony-em`.
+    fn parsimony_sink(&mut self) -> Option<pugutils::TargetLevelSink<'_, P>> {
+        (!self.tiny).then(|| (self.identity.as_slice(), &mut self.eqc))
     }
 
     /// Keep the non-zero entries of a dense per-probe count vector.
@@ -715,8 +731,9 @@ impl<P: EqClassPayload> ProbeResolver<P> {
         );
     }
 
-    /// Resolve one cell at probe level into `self.entries`. Only reads the
-    /// chunk's records; `eq_map` is used as scratch and left cleared.
+    /// Resolve one cell at probe level into `self.entries` (after `begin_cell`
+    /// and the gene pass). Only reads the chunk's records; `eq_map` is used as
+    /// scratch and left cleared.
     fn resolve<B, R>(
         &mut self,
         c: &mut libradicl::chunk::Chunk<R>,
@@ -737,9 +754,8 @@ impl<P: EqClassPayload> ProbeResolver<P> {
         <R as MappedRecord>::ParsingContext: Clone,
         <R as MappedRecord>::ParsingContext: Send,
     {
-        self.entries.clear();
         let num_probes = self.identity.len();
-        if c.reads.len() < config.tiny_cell_thresh {
+        if self.tiny {
             quantify_small_cell_sparse::<B, R>(
                 c,
                 &self.identity,
@@ -757,7 +773,6 @@ impl<P: EqClassPayload> ProbeResolver<P> {
             }
             return;
         }
-        self.eqc.clear();
         match config.resolution {
             ResolutionStrategy::CellRangerLike | ResolutionStrategy::CellRangerLikeEm => {
                 let only_unique = config.resolution == ResolutionStrategy::CellRangerLike;
@@ -825,6 +840,35 @@ impl<P: EqClassPayload> ProbeResolver<P> {
                 );
                 eq_map.clear();
                 self.set_from_dense(&counts);
+            }
+            ResolutionStrategy::Parsimony | ResolutionStrategy::ParsimonyEm => {
+                // `eqc` was filled by the gene pass; resolve it as that pass
+                // resolves its gene-level hash.
+                let only_unique = config.resolution == ResolutionStrategy::Parsimony;
+                let counts = if P::HAS_PROBS {
+                    em_optimize_long_read(
+                        &self.eqc,
+                        &mut self.unique_evidence,
+                        &mut self.no_ambiguity,
+                        config.em_init_type,
+                        num_probes,
+                        only_unique,
+                        log,
+                    )
+                } else {
+                    em_optimize(
+                        &self.eqc,
+                        &mut self.unique_evidence,
+                        &mut self.no_ambiguity,
+                        config.em_init_type,
+                        num_probes,
+                        only_unique,
+                        log,
+                    )
+                };
+                self.set_from_dense(&counts);
+                self.unique_evidence.fill(false);
+                self.no_ambiguity.fill(false);
             }
             other => unreachable!("--probe-mtx is rejected for --resolution {other:?} at the CLI"),
         }
@@ -960,6 +1004,10 @@ where
             let mut num_expr: u32 = 0;
 
             let mut bootstraps: Vec<Vec<f32>> = Vec::new();
+
+            if let Some(pr) = probe_resolver.as_mut() {
+                pr.begin_cell(c.reads.len(), &config);
+            }
 
             // Fast path for very small cells: bypass all HashMap-based
             // equivalence class machinery. Directly compute gene counts
@@ -1154,6 +1202,7 @@ where
                                 &eq_map,
                                 &shared.tid_to_gid,
                                 &mut gene_eqc,
+                                probe_resolver.as_mut().and_then(|pr| pr.parsimony_sink()),
                                 &s,
                                 config.large_graph_thresh,
                                 &log,

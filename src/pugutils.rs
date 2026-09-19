@@ -1329,11 +1329,23 @@ fn get_num_molecules_large_component<P: EqClassPayload>(
 /// and the transcript-to-gene map `tid_to_gid`, apply the parsimonious
 /// umi resolution algorithm.  Pass any relevant logging messages along to
 /// `log`.
+/// Identity target map plus the hash that collects target-level labels; see
+/// `get_num_molecules`.
+pub type TargetLevelSink<'a, P> = (&'a [u32], &'a mut HashMap<Vec<u32>, P, ahash::RandomState>);
+
+/// `probe`, when given, also records every molecule under its target-level
+/// label (the targets compatible with it, before projection to genes) into a
+/// second hash, together with the identity target map used for large
+/// components. The cover itself does not depend on `tid_to_gid`, so that hash
+/// equals the gene-level hash of a run whose t2g maps each target to itself.
+/// Requires a transcript-level `eqmap`.
+#[allow(clippy::too_many_arguments)]
 pub fn get_num_molecules<P: EqClassPayload>(
     g: &petgraph::graphmap::GraphMap<(u32, u32), (), petgraph::Directed>,
     eqmap: &EqMap,
     tid_to_gid: &[u32],
     gene_eqclass_hash: &mut HashMap<Vec<u32>, P, ahash::RandomState>,
+    mut probe: Option<TargetLevelSink<'_, P>>,
     hasher_state: &ahash::RandomState,
     large_graph_thresh: usize,
     log: &slog::Logger,
@@ -1351,6 +1363,10 @@ pub fn get_num_molecules<P: EqClassPayload>(
         EqMapType::GeneLevel => true,
         EqMapType::TranscriptLevel => false,
     };
+    assert!(
+        probe.is_none() || !gene_level_eq_map,
+        "target-level labels need a transcript-level equivalence class map"
+    );
 
     let comps = weakly_connected_components(g);
 
@@ -1405,6 +1421,17 @@ pub fn get_num_molecules<P: EqClassPayload>(
                     gene_eqclass_hash,
                     log,
                 );
+                if let Some((identity, probe_hash)) = probe.as_mut() {
+                    get_num_molecules_large_component(
+                        g,
+                        eqmap,
+                        comp_verts,
+                        identity,
+                        hasher_state,
+                        probe_hash,
+                        log,
+                    );
+                }
                 warn!(
                     log,
                     "found connected component with {} vertices; resolved with cr-like resolution.",
@@ -1548,6 +1575,15 @@ pub fn get_num_molecules<P: EqClassPayload>(
 
                 // at this point, whatever transcript ids remain in
                 // global_txps appear in all vertices of the mcc
+                if let Some((_, probe_hash)) = probe.as_mut() {
+                    let mut label: Vec<u32> = global_txps.iter().cloned().collect();
+                    label.sort_unstable();
+                    let payload = probe_hash.entry(label).or_insert(P::new(global_txps.len()));
+                    payload.inc();
+                    if P::HAS_PROBS {
+                        payload.add_probs(&global_txp_prob);
+                    }
+                }
 
                 //} // unsafe
 
@@ -1628,6 +1664,18 @@ pub fn get_num_molecules<P: EqClassPayload>(
 
                     txp_prob_temp.sort_unstable_by_key(|(t, _)| *t);
                     global_txp_prob = txp_prob_temp.iter().map(|(_, p)| *p).collect();
+                }
+            }
+
+            if let Some((_, probe_hash)) = probe.as_mut() {
+                let mut label = tl.to_vec();
+                label.sort_unstable();
+                label.dedup();
+                let label_len = label.len();
+                let payload = probe_hash.entry(label).or_insert(P::new(label_len));
+                payload.inc();
+                if P::HAS_PROBS {
+                    payload.add_probs(&global_txp_prob);
                 }
             }
 

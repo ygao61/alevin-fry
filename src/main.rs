@@ -343,7 +343,7 @@ fn main() -> anyhow::Result<()> {
     .arg(arg!(--"small-thresh" <SMALLTHRESH> "cells with fewer than this many reads are resolved by a fast path that applies cr-like (winner-take-all) semantics regardless of --resolution; pass 0 to resolve every cell with the requested strategy")
         .value_parser(value_parser!(usize))
         .default_value("100"))
-    .arg(arg!(--"probe-mtx" "also write a probe (reference target) x cell count matrix (alevin/probe_quants_mat.mtx) in the same pass (cr-like, cr-like-em, trivial). Each probe is resolved as its own feature, so the probe counts of a gene need not sum to its gene count. The probe matrix is never split by splicing status: with a 3-column (USA) tg-map it still has one column per probe, and a warning is printed"))
+    .arg(arg!(--"probe-mtx" "also write a probe (reference target) x cell count matrix (alevin/probe_quants_mat.mtx) in the same pass (cr-like, cr-like-em, trivial, parsimony, parsimony-em). Each probe is resolved as its own feature, so the probe counts of a gene need not sum to its gene count. The probe matrix is never split by splicing status: with a 3-column (USA) tg-map it still has one column per probe, and a warning is printed"))
     // Multi-sample output option (for multi-barcode RAD files)
     .arg(arg!(--"multi-sample-output" <MSOUTPUT> "output mode for multi-sample data: separate per-sample matrices, one combined matrix, or both")
         .value_parser(["separate", "combined", "both"])
@@ -729,6 +729,8 @@ fn main() -> anyhow::Result<()> {
                 ResolutionStrategy::CellRangerLike
                     | ResolutionStrategy::CellRangerLikeEm
                     | ResolutionStrategy::Trivial
+                    | ResolutionStrategy::Parsimony
+                    | ResolutionStrategy::ParsimonyEm
             )
         {
             crit!(

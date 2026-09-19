@@ -1612,6 +1612,26 @@ fn assert_mtx_match(
     }
 }
 
+/// Like `read_labeled_mtx` for another matrix file sharing the row labels;
+/// `cols_prefix` selects `quants_mat_cols.txt` or `probe_quants_mat_cols.txt`.
+fn read_labeled_mtx_as(
+    alevin_dir: &Path,
+    mtx_name: &str,
+    cols_prefix: &str,
+) -> std::collections::BTreeMap<(String, String), f64> {
+    let tmp = tempfile::tempdir().unwrap();
+    let cols = format!("{cols_prefix}quants_mat_cols.txt");
+    for f in ["quants_mat_rows.txt", cols.as_str()] {
+        std::fs::copy(alevin_dir.join(f), tmp.path().join(f)).unwrap();
+    }
+    std::fs::copy(
+        alevin_dir.join(mtx_name),
+        tmp.path().join(format!("{cols_prefix}quants_mat.mtx")),
+    )
+    .unwrap();
+    read_labeled_mtx(tmp.path(), cols_prefix)
+}
+
 /// One sample, three cells sized to take the tiny (< 100 reads), small
 /// (<= 250) and large cr-like paths. Reference `gene_i` belongs to gene
 /// `G{i/2}`, so every gene has two probes. Reads draw UMIs from a small pool
@@ -1737,6 +1757,7 @@ fn probe_mtx_matches_identity_t2g_quant_and_leaves_gene_matrix_unchanged() {
                resolution: ResolutionStrategy,
                umi_edit: u32,
                large_graph_thresh: usize,
+               num_bootstraps: u32,
                probe_mtx: bool|
      -> std::path::PathBuf {
         let out = tmp.path().join(name);
@@ -1745,9 +1766,9 @@ fn probe_mtx_matches_identity_t2g_quant_and_leaves_gene_matrix_unchanged() {
             .tg_map(t2g)
             .output_dir(&out)
             .num_threads(2)
-            .num_bootstraps(0)
+            .num_bootstraps(num_bootstraps)
             .init_uniform(false)
-            .summary_stat(false)
+            .summary_stat(num_bootstraps > 0)
             .dump_eq(false)
             .resolution(resolution)
             .pug_exact_umi(false)
@@ -1788,15 +1809,25 @@ fn probe_mtx_matches_identity_t2g_quant_and_leaves_gene_matrix_unchanged() {
             res,
             umi_edit,
             lgt,
+            0,
             true,
         );
-        let gene_only = run(&format!("gene_{tag}"), &gene_t2g, res, umi_edit, lgt, false);
+        let gene_only = run(
+            &format!("gene_{tag}"),
+            &gene_t2g,
+            res,
+            umi_edit,
+            lgt,
+            0,
+            false,
+        );
         let identity = run(
             &format!("identity_{tag}"),
             &probe_t2g,
             res,
             umi_edit,
             lgt,
+            0,
             false,
         );
 
@@ -1835,4 +1866,60 @@ fn probe_mtx_matches_identity_t2g_quant_and_leaves_gene_matrix_unchanged() {
     }
     // The fixture must exercise the per-probe semantics, not just trivially agree.
     assert!(probe_sum_differs_from_gene);
+
+    // `-b` with an EM strategy: the probe bootstrap summary is written for the
+    // same cells as a bootstrap of the identity-t2g quant. Resampling is random,
+    // so compare its deterministic properties: each cell's mean sums to the
+    // cell's EM total (resampling keeps the UMI total) and variances are >= 0.
+    for res in [
+        ResolutionStrategy::CellRangerLikeEm,
+        ResolutionStrategy::ParsimonyEm,
+    ] {
+        let tag = format!("{res:?}_boot");
+        let with_flag = run(
+            &format!("with_flag_{tag}"),
+            &gene_t2g,
+            res,
+            0,
+            1000,
+            5,
+            true,
+        );
+        let identity = run(
+            &format!("identity_{tag}"),
+            &probe_t2g,
+            res,
+            0,
+            1000,
+            5,
+            false,
+        );
+        let row_sums = |m: &std::collections::BTreeMap<(String, String), f64>| {
+            let mut out = std::collections::BTreeMap::new();
+            for ((row, _), v) in m {
+                *out.entry(row.clone()).or_insert(0.0) += v;
+            }
+            out
+        };
+        let mean = read_labeled_mtx_as(&with_flag, "probe_bootstraps_mean.mtx", "probe_");
+        let var = read_labeled_mtx_as(&with_flag, "probe_bootstraps_var.mtx", "probe_");
+        let id_mean = read_labeled_mtx_as(&identity, "bootstraps_mean.mtx", "");
+        let mean_sums = row_sums(&mean);
+        assert!(!mean_sums.is_empty());
+        assert_eq!(
+            mean_sums.keys().collect::<Vec<_>>(),
+            row_sums(&id_mean).keys().collect::<Vec<_>>(),
+            "{tag}: bootstrapped cells differ"
+        );
+        let counts = row_sums(&read_labeled_mtx(&with_flag, "probe_"));
+        for (row, s) in &mean_sums {
+            assert!(
+                (s - counts[row]).abs() <= 1e-3 * counts[row].max(1.0),
+                "{tag}: {row} mean {s} vs {}",
+                counts[row]
+            );
+        }
+        assert!(var.values().all(|v| *v >= 0.0), "{tag}: negative variance");
+        assert!(with_flag.join("bootstraps_mean.mtx").exists());
+    }
 }

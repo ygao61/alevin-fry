@@ -411,8 +411,14 @@ struct WorkerConfig {
     tiny_cell_thresh: usize,
 }
 
-/// Identity target map and probe x cell matrix writer for `--probe-mtx`.
-type ProbeOutput = (Arc<Vec<u32>>, Arc<Mutex<MatrixMarketWriter<File>>>);
+/// `--probe-mtx` outputs shared by the workers: the identity target map, the
+/// probe x cell matrix writer and, with `-b`, the probe bootstrap writers.
+#[derive(Clone)]
+struct ProbeOutput {
+    identity: Arc<Vec<u32>>,
+    matrix: Arc<Mutex<MatrixMarketWriter<File>>>,
+    bootstrap: Option<Arc<BootstrapOutput>>,
+}
 
 struct WorkerSharedState<R: MappedRecord> {
     /// This worker's own drain-safe view of the producer's meta-chunk queue.
@@ -426,8 +432,7 @@ struct WorkerSharedState<R: MappedRecord> {
     /// feature critical section, and vice-versa.
     matrix_out: Arc<Mutex<MatrixMarketWriter<File>>>,
     bootstrap_out: Option<Arc<BootstrapOutput>>,
-    /// `--probe-mtx`: the identity target map and the probe x cell matrix
-    /// writer (rows shared with `matrix_out`).
+    /// `--probe-mtx` outputs (rows shared with `matrix_out`).
     probe_out: Option<ProbeOutput>,
     output_failed: Arc<AtomicBool>,
     eqid_map_lock: Arc<Mutex<EqcMap>>,
@@ -662,6 +667,46 @@ fn quantify_small_cell_sparse<B, R>(
     gene_umi_buf.sort_unstable();
 }
 
+/// Finalize `<prefix>bootstraps_{mean,var}.mtx` once all workers are done;
+/// both files are removed when no bootstrap means were produced.
+fn finish_bootstrap_output(
+    output: Arc<BootstrapOutput>,
+    output_matrix_path: &std::path::Path,
+    prefix: &str,
+    log: &slog::Logger,
+) -> anyhow::Result<()> {
+    let output = Arc::try_unwrap(output)
+        .map_err(|_| anyhow::anyhow!("bootstrap output is still held by a worker"))?;
+    let mean_nnz = output
+        .mean
+        .lock()
+        .map_err(|_| anyhow::anyhow!("bootstrap mean output lock was poisoned"))?
+        .finish()
+        .context("could not finalize bootstrap mean matrix")?;
+    let var_nnz = output
+        .variance
+        .lock()
+        .map_err(|_| anyhow::anyhow!("bootstrap variance output lock was poisoned"))?
+        .finish()
+        .context("could not finalize bootstrap variance matrix")?;
+    // Preserve the existing file set when no bootstrap means were produced.
+    // Close first so removal also works on platforms that lock open files.
+    drop(output);
+    if mean_nnz == 0 {
+        fs::remove_file(output_matrix_path.join(format!("{prefix}bootstraps_mean.mtx")))?;
+        fs::remove_file(output_matrix_path.join(format!("{prefix}bootstraps_var.mtx")))?;
+    } else {
+        info!(
+            log,
+            "wrote {}bootstrap summary statistics: mean ({} entries), variance ({} entries)",
+            prefix,
+            mean_nnz,
+            var_nnz
+        );
+    }
+    Ok(())
+}
+
 /// Per-worker state for the optional probe x cell matrix (`--probe-mtx`).
 ///
 /// Each cell is resolved a second time with the identity map in place of
@@ -670,6 +715,8 @@ fn quantify_small_cell_sparse<B, R>(
 /// that a quant with an identity t2g would take, so the output equals such a
 /// quant exactly. UMI correction, deduplication, tie handling and EM therefore
 /// act per probe: a gene's probe counts need not sum to its gene count.
+/// With `-b` (EM strategies) the probe estimate is bootstrapped too, into
+/// `probe_bootstraps_{mean,var}.mtx`.
 ///
 /// Always resolved without splicing status: in USA mode the gene matrix has
 /// S/U/A columns, but a probe's region is fixed, so the probe matrix keeps one
@@ -689,10 +736,14 @@ struct ProbeResolver<P: EqClassPayload> {
     no_ambiguity: Vec<bool>,
     /// Whether the current cell takes the tiny-cell fast path at probe level.
     tiny: bool,
+    /// `-b` with an EM strategy: this cell's probe-level bootstrap summary.
+    bootstraps: Vec<Vec<f32>>,
+    boot_helper: BootstrapHelper,
+    em_scratch: EmSubsetScratch,
 }
 
 impl<P: EqClassPayload> ProbeResolver<P> {
-    fn new(identity: Arc<Vec<u32>>) -> Self {
+    fn new(identity: Arc<Vec<u32>>, summary_stat: bool) -> Self {
         let s = ahash::RandomState::with_seeds(2u64, 7u64, 1u64, 8u64);
         Self {
             eqc: HashMap::with_hasher(s),
@@ -704,6 +755,9 @@ impl<P: EqClassPayload> ProbeResolver<P> {
             no_ambiguity: vec![false; identity.len()],
             identity,
             tiny: false,
+            bootstraps: Vec::new(),
+            boot_helper: BootstrapHelper::new(summary_stat),
+            em_scratch: EmSubsetScratch::default(),
         }
     }
 
@@ -712,7 +766,24 @@ impl<P: EqClassPayload> ProbeResolver<P> {
     fn begin_cell(&mut self, num_reads: usize, config: &WorkerConfig) {
         self.entries.clear();
         self.eqc.clear();
+        self.bootstraps.clear();
         self.tiny = num_reads < config.tiny_cell_thresh;
+    }
+
+    /// Bootstrap the probe-level EM estimate `counts` when `-b` was given, as
+    /// the gene pass does for its gene-level estimate.
+    fn bootstrap(&mut self, counts: &[f32], config: &WorkerConfig, log: &slog::Logger) {
+        if config.num_bootstraps > 0 {
+            self.bootstraps = run_bootstrap_with_scratch(
+                &self.eqc,
+                config.num_bootstraps,
+                counts,
+                config.init_uniform,
+                config.summary_stat,
+                log,
+                &mut self.em_scratch,
+            );
+        }
     }
 
     /// Target-level sink for the gene pass of `parsimony` / `parsimony-em`.
@@ -826,6 +897,7 @@ impl<P: EqClassPayload> ProbeResolver<P> {
                         log,
                     );
                     self.set_from_dense(&counts);
+                    self.bootstrap(&counts, config, log);
                     self.unique_evidence.fill(false);
                     self.no_ambiguity.fill(false);
                 }
@@ -867,6 +939,9 @@ impl<P: EqClassPayload> ProbeResolver<P> {
                     )
                 };
                 self.set_from_dense(&counts);
+                if !only_unique {
+                    self.bootstrap(&counts, config, log);
+                }
                 self.unique_evidence.fill(false);
                 self.no_ambiguity.fill(false);
             }
@@ -948,7 +1023,7 @@ where
     let mut probe_resolver: Option<ProbeResolver<P>> = shared
         .probe_out
         .as_ref()
-        .map(|(identity, _)| ProbeResolver::new(identity.clone()));
+        .map(|po| ProbeResolver::new(po.identity.clone(), config.summary_stat));
 
     let mut local_nrec = 0usize;
     // Drain MetaChunks until the producer is done and the queue is empty.
@@ -1504,13 +1579,16 @@ where
                         .record_cell(row_index, &bootstraps, output)
                         .context("could not write bootstrap matrices")?;
                 }
-                if let (Some(pr), Some((_, probe_matrix))) =
-                    (probe_resolver.as_mut(), &shared.probe_out)
-                {
+                if let (Some(pr), Some(po)) = (probe_resolver.as_mut(), &shared.probe_out) {
                     for &(ind, val) in pr.entries.iter() {
                         pr.batch
-                            .push(row_index, ind, val, probe_matrix)
+                            .push(row_index, ind, val, &po.matrix)
                             .context("could not write probe count matrix")?;
+                    }
+                    if let Some(output) = &po.bootstrap {
+                        pr.boot_helper
+                            .record_cell(row_index, &pr.bootstraps, output)
+                            .context("could not write probe bootstrap matrices")?;
                     }
                 }
                 Ok(row_index)
@@ -1578,12 +1656,15 @@ where
                     .flush(output)
                     .context("could not flush bootstrap batches")?;
             }
-            if let (Some(pr), Some((_, probe_matrix))) =
-                (probe_resolver.as_mut(), &shared.probe_out)
-            {
+            if let (Some(pr), Some(po)) = (probe_resolver.as_mut(), &shared.probe_out) {
                 pr.batch
-                    .flush(probe_matrix)
+                    .flush(&po.matrix)
                     .context("could not flush probe count matrix batch")?;
+                if let Some(output) = &po.bootstrap {
+                    pr.boot_helper
+                        .flush(output)
+                        .context("could not flush probe bootstrap batches")?;
+                }
             }
             Ok(())
         })();
@@ -2250,18 +2331,29 @@ where
     };
     let probe_out = if quant_opts.probe_mtx {
         let num_probes = hdr.ref_count as usize;
-        let path = output_matrix_path.join("probe_quants_mat.mtx");
-        let file =
-            File::create(&path).with_context(|| format!("could not create {}", path.display()))?;
-        let identity: Vec<u32> = (0..num_probes as u32).collect();
-        Some((
-            Arc::new(identity),
-            Arc::new(Mutex::new(MatrixMarketWriter::new(
+        let open_probe_matrix = |name: &str| -> anyhow::Result<MatrixMarketWriter<File>> {
+            let path = output_matrix_path.join(name);
+            let file = File::create(&path)
+                .with_context(|| format!("could not create {}", path.display()))?;
+            Ok(MatrixMarketWriter::new(
                 file,
                 num_cells as usize,
                 num_probes,
-            )?)),
-        ))
+            )?)
+        };
+        let bootstrap = if num_bootstraps > 0 {
+            Some(Arc::new(BootstrapOutput {
+                mean: Mutex::new(open_probe_matrix("probe_bootstraps_mean.mtx")?),
+                variance: Mutex::new(open_probe_matrix("probe_bootstraps_var.mtx")?),
+            }))
+        } else {
+            None
+        };
+        Some(ProbeOutput {
+            identity: Arc::new((0..num_probes as u32).collect()),
+            matrix: Arc::new(Mutex::new(open_probe_matrix("probe_quants_mat.mtx")?)),
+            bootstrap,
+        })
     } else {
         None
     };
@@ -2497,38 +2589,11 @@ where
     );
 
     if let Some(output) = bootstrap_out {
-        let output = Arc::try_unwrap(output)
-            .map_err(|_| anyhow::anyhow!("bootstrap output is still held by a worker"))?;
-        let mean_nnz = output
-            .mean
-            .lock()
-            .map_err(|_| anyhow::anyhow!("bootstrap mean output lock was poisoned"))?
-            .finish()
-            .context("could not finalize bootstrap mean matrix")?;
-        let var_nnz = output
-            .variance
-            .lock()
-            .map_err(|_| anyhow::anyhow!("bootstrap variance output lock was poisoned"))?
-            .finish()
-            .context("could not finalize bootstrap variance matrix")?;
-        // Preserve the existing file set when no bootstrap means were produced.
-        // Close first so removal also works on platforms that lock open files.
-        drop(output);
-        if mean_nnz == 0 {
-            fs::remove_file(output_matrix_path.join("bootstraps_mean.mtx"))?;
-            fs::remove_file(output_matrix_path.join("bootstraps_var.mtx"))?;
-        } else {
-            info!(
-                log,
-                "wrote bootstrap summary statistics: mean ({} entries), variance ({} entries)",
-                mean_nnz,
-                var_nnz
-            );
-        }
+        finish_bootstrap_output(output, &output_matrix_path, "", log)?;
     }
 
-    let probe_nnz = if let Some((_, probe_matrix)) = probe_out {
-        let nnz = Arc::try_unwrap(probe_matrix)
+    let probe_nnz = if let Some(po) = probe_out {
+        let nnz = Arc::try_unwrap(po.matrix)
             .map_err(|_| anyhow::anyhow!("probe count matrix is still held by a worker"))?
             .into_inner()
             .map_err(|_| anyhow::anyhow!("probe count matrix output lock was poisoned"))?
@@ -2546,6 +2611,9 @@ where
             writeln!(pn_writer, "{}", n)?;
         }
         pn_writer.flush()?;
+        if let Some(output) = po.bootstrap {
+            finish_bootstrap_output(output, &output_matrix_path, "probe_", log)?;
+        }
         Some(nnz)
     } else {
         None

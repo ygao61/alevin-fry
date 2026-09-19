@@ -666,10 +666,10 @@ fn quantify_small_cell_sparse<B, R>(
 ///
 /// Each cell is resolved a second time with the identity map in place of
 /// `tid_to_gid`, i.e. every reference target (probe) is its own feature. The
-/// cell takes the same path (tiny / small / large) that a gene-level quant with
-/// an identity t2g would take, so the output equals such a quant exactly.
-/// UMI correction, deduplication and the winner-take-all tie drop therefore act
-/// per probe: a gene's probe counts need not sum to its gene count.
+/// cell takes the same path (tiny / small / large, and the same resolution)
+/// that a quant with an identity t2g would take, so the output equals such a
+/// quant exactly. UMI correction, deduplication, tie handling and EM therefore
+/// act per probe: a gene's probe counts need not sum to its gene count.
 ///
 /// Always resolved without splicing status: in USA mode the gene matrix has
 /// S/U/A columns, but a probe's region is fixed, so the probe matrix keeps one
@@ -684,19 +684,35 @@ struct ProbeResolver<P: EqClassPayload> {
     /// This cell's non-zero `(probe index, count)` entries, sorted by index.
     entries: Vec<(usize, f32)>,
     batch: MatrixBatch,
+    /// EM evidence buffers over the probe axis (the gene path keeps its own).
+    unique_evidence: Vec<bool>,
+    no_ambiguity: Vec<bool>,
 }
 
 impl<P: EqClassPayload> ProbeResolver<P> {
     fn new(identity: Arc<Vec<u32>>) -> Self {
         let s = ahash::RandomState::with_seeds(2u64, 7u64, 1u64, 8u64);
         Self {
-            identity,
             eqc: HashMap::with_hasher(s),
             scratch: pugutils::CrLikeScratch::default(),
             probe_umi_buf: Vec::new(),
             entries: Vec::new(),
             batch: MatrixBatch::default(),
+            unique_evidence: vec![false; identity.len()],
+            no_ambiguity: vec![false; identity.len()],
+            identity,
         }
+    }
+
+    /// Keep the non-zero entries of a dense per-probe count vector.
+    fn set_from_dense(&mut self, counts: &[f32]) {
+        self.entries.extend(
+            counts
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| **c > 0.0)
+                .map(|(i, c)| (i, *c)),
+        );
     }
 
     /// Resolve one cell at probe level into `self.entries`. Only reads the
@@ -742,43 +758,76 @@ impl<P: EqClassPayload> ProbeResolver<P> {
             return;
         }
         self.eqc.clear();
-        if c.reads.len() <= 250 {
-            pugutils::get_num_molecules_cell_ranger_like_small::<B, R, P>(
-                c,
-                &self.identity,
-                num_probes,
-                &mut self.eqc,
-                SplicedAmbiguityModel::WinnerTakeAll,
-                &mut self.scratch,
-                config.crlike_umi_edit,
-                config.umi_len,
-                true,
-                log,
-            );
-        } else {
-            eq_map.init_from_chunk::<R>(c);
-            pugutils::get_num_molecules_cell_ranger_like(
-                eq_map,
-                &self.identity,
-                num_probes,
-                &mut self.eqc,
-                SplicedAmbiguityModel::WinnerTakeAll,
-                &mut self.scratch,
-                config.crlike_umi_edit,
-                config.umi_len,
-                true,
-                log,
-            );
-            eq_map.clear();
-        }
-        // cr-like keeps only single-probe labels (as em_optimize with
-        // only_unique); multi-probe labels are ties and are dropped.
-        for (labels, payload) in self.eqc.iter() {
-            if let [pid] = labels.as_slice() {
-                self.entries.push((*pid as usize, payload.count() as f32));
+        match config.resolution {
+            ResolutionStrategy::CellRangerLike | ResolutionStrategy::CellRangerLikeEm => {
+                let only_unique = config.resolution == ResolutionStrategy::CellRangerLike;
+                if c.reads.len() <= 250 {
+                    pugutils::get_num_molecules_cell_ranger_like_small::<B, R, P>(
+                        c,
+                        &self.identity,
+                        num_probes,
+                        &mut self.eqc,
+                        SplicedAmbiguityModel::WinnerTakeAll,
+                        &mut self.scratch,
+                        config.crlike_umi_edit,
+                        config.umi_len,
+                        only_unique,
+                        log,
+                    );
+                } else {
+                    eq_map.init_from_chunk::<R>(c);
+                    pugutils::get_num_molecules_cell_ranger_like(
+                        eq_map,
+                        &self.identity,
+                        num_probes,
+                        &mut self.eqc,
+                        SplicedAmbiguityModel::WinnerTakeAll,
+                        &mut self.scratch,
+                        config.crlike_umi_edit,
+                        config.umi_len,
+                        only_unique,
+                        log,
+                    );
+                    eq_map.clear();
+                }
+                if only_unique {
+                    // cr-like keeps only single-probe labels (as em_optimize
+                    // with only_unique); multi-probe labels are ties and are
+                    // dropped.
+                    for (labels, payload) in self.eqc.iter() {
+                        if let [pid] = labels.as_slice() {
+                            self.entries.push((*pid as usize, payload.count() as f32));
+                        }
+                    }
+                    self.entries.sort_unstable_by_key(|e| e.0);
+                } else {
+                    let counts = em_optimize(
+                        &self.eqc,
+                        &mut self.unique_evidence,
+                        &mut self.no_ambiguity,
+                        config.em_init_type,
+                        num_probes,
+                        false,
+                        log,
+                    );
+                    self.set_from_dense(&counts);
+                    self.unique_evidence.fill(false);
+                    self.no_ambiguity.fill(false);
+                }
             }
+            ResolutionStrategy::Trivial => {
+                eq_map.init_from_chunk(c);
+                let (counts, _) = pugutils::get_num_molecules_trivial_discard_all_ambig(
+                    eq_map,
+                    &self.identity,
+                    num_probes,
+                    log,
+                );
+                eq_map.clear();
+                self.set_from_dense(&counts);
+            }
+            other => unreachable!("--probe-mtx is rejected for --resolution {other:?} at the CLI"),
         }
-        self.entries.sort_unstable_by_key(|e| e.0);
     }
 }
 

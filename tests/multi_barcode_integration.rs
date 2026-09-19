@@ -1584,6 +1584,34 @@ fn read_labeled_mtx(
     out
 }
 
+/// Assert two labeled matrices agree. EM-based strategies are compared with a
+/// small tolerance: the EM sums over a hash map whose iteration order depends on
+/// which cells a worker thread processed before, so results can differ in the
+/// last f32 bits between runs of the same binary. Other strategies must match
+/// exactly.
+fn assert_mtx_match(
+    a: &std::collections::BTreeMap<(String, String), f64>,
+    b: &std::collections::BTreeMap<(String, String), f64>,
+    exact: bool,
+    what: &str,
+) {
+    if exact {
+        assert_eq!(a, b, "{what}");
+        return;
+    }
+    let keys: std::collections::BTreeSet<_> = a.keys().chain(b.keys()).collect();
+    for k in keys {
+        let (x, y) = (
+            a.get(k).copied().unwrap_or(0.0),
+            b.get(k).copied().unwrap_or(0.0),
+        );
+        assert!(
+            (x - y).abs() <= 1e-4 + 1e-5 * y.abs(),
+            "{what}: {k:?} {x} vs {y}"
+        );
+    }
+}
+
 /// One sample, three cells sized to take the tiny (< 100 reads), small
 /// (<= 250) and large cr-like paths. Reference `gene_i` belongs to gene
 /// `G{i/2}`, so every gene has two probes. Reads draw UMIs from a small pool
@@ -1643,7 +1671,8 @@ fn create_probe_level_rad(path: &Path, sample_bc: u64, cell_sizes: &[usize]) -> 
 
 /// `--probe-mtx` must (a) leave the gene matrix unchanged and (b) produce
 /// exactly the matrix of a separate quant whose t2g maps every probe to itself,
-/// on all three cr-like paths, with and without Hamming-1 UMI correction.
+/// for every supported resolution, on the tiny / small / large cell paths, with
+/// and without Hamming-1 UMI correction.
 #[test]
 fn probe_mtx_matches_identity_t2g_quant_and_leaves_gene_matrix_unchanged() {
     use alevin_fry::cellfilter::{CellFilterMethod, generate_permit_list};
@@ -1705,6 +1734,7 @@ fn probe_mtx_matches_identity_t2g_quant_and_leaves_gene_matrix_unchanged() {
 
     let run = |name: &str,
                t2g: &std::path::PathBuf,
+               resolution: ResolutionStrategy,
                umi_edit: u32,
                probe_mtx: bool|
      -> std::path::PathBuf {
@@ -1718,7 +1748,7 @@ fn probe_mtx_matches_identity_t2g_quant_and_leaves_gene_matrix_unchanged() {
             .init_uniform(false)
             .summary_stat(false)
             .dump_eq(false)
-            .resolution(ResolutionStrategy::CellRangerLike)
+            .resolution(resolution)
             .pug_exact_umi(false)
             .crlike_umi_edit(umi_edit)
             .probe_mtx(probe_mtx)
@@ -1734,34 +1764,35 @@ fn probe_mtx_matches_identity_t2g_quant_and_leaves_gene_matrix_unchanged() {
         out.join("alevin")
     };
 
+    let cases = [
+        (ResolutionStrategy::CellRangerLike, 0u32),
+        (ResolutionStrategy::CellRangerLike, 1),
+        (ResolutionStrategy::CellRangerLikeEm, 0),
+        (ResolutionStrategy::CellRangerLikeEm, 1),
+        (ResolutionStrategy::Trivial, 0),
+    ];
     let mut probe_sum_differs_from_gene = false;
-    for umi_edit in [0u32, 1] {
-        let with_flag = run(
-            &format!("with_flag_ed{umi_edit}"),
-            &gene_t2g,
-            umi_edit,
-            true,
-        );
-        let gene_only = run(&format!("gene_ed{umi_edit}"), &gene_t2g, umi_edit, false);
-        let identity = run(
-            &format!("identity_ed{umi_edit}"),
-            &probe_t2g,
-            umi_edit,
-            false,
-        );
+    for (res, umi_edit) in cases {
+        let tag = format!("{res:?}_ed{umi_edit}");
+        let with_flag = run(&format!("with_flag_{tag}"), &gene_t2g, res, umi_edit, true);
+        let gene_only = run(&format!("gene_{tag}"), &gene_t2g, res, umi_edit, false);
+        let identity = run(&format!("identity_{tag}"), &probe_t2g, res, umi_edit, false);
 
+        let exact = res != ResolutionStrategy::CellRangerLikeEm;
         let gene = read_labeled_mtx(&with_flag, "");
-        assert_eq!(
-            gene,
-            read_labeled_mtx(&gene_only, ""),
-            "ed{umi_edit}: gene matrix changed"
+        assert_mtx_match(
+            &gene,
+            &read_labeled_mtx(&gene_only, ""),
+            exact,
+            &format!("{tag}: gene matrix changed"),
         );
         let probe = read_labeled_mtx(&with_flag, "probe_");
         assert!(!probe.is_empty());
-        assert_eq!(
-            probe,
-            read_labeled_mtx(&identity, ""),
-            "ed{umi_edit}: probe matrix differs from the identity-t2g quant"
+        assert_mtx_match(
+            &probe,
+            &read_labeled_mtx(&identity, ""),
+            exact,
+            &format!("{tag}: probe matrix differs from the identity-t2g quant"),
         );
         let probe_cols =
             std::fs::read_to_string(with_flag.join("probe_quants_mat_cols.txt")).unwrap();

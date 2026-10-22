@@ -1211,19 +1211,42 @@ pub fn read_filter_list(
     Ok(fset)
 }
 
-/// The `data_type` value recorded in `generate_permit_list.json`.
+/// The `data_type` value recorded in `generate_permit_list.json` for
+/// `generate-permit-list --data-type flex`.
 pub const DATA_TYPE_FLEX: &str = "flex";
 
-/// The data type recorded by generate-permit-list, if it identified one.
+/// The data type recorded by generate-permit-list, if one was declared to it
+/// with `--data-type`.
 ///
-/// `None` covers both a run whose layout identified nothing and a directory
-/// written before the key existed, so it means "not identified as Flex" rather
-/// than "certainly not Flex".
+/// `None` covers both a run that declared none and a directory written before
+/// the key existed, so it means "not declared Flex" rather than "certainly not
+/// Flex".
 pub fn read_data_type(input_dir: &PathBuf) -> Option<String> {
     let parent = std::path::Path::new(input_dir);
     let meta_data_file = File::open(parent.join("generate_permit_list.json")).ok()?;
     let mdata: serde_json::Value = serde_json::from_reader(BufReader::new(meta_data_file)).ok()?;
     mdata.get("data_type")?.as_str().map(str::to_owned)
+}
+
+/// The `version_str` of the alevin-fry that wrote `generate_permit_list.json`,
+/// when that file has no `data_type` key at all because it predates the key.
+///
+/// `None` when the key is present (null included) or the file cannot be read,
+/// so it tells an older directory apart from one written without `--data-type`.
+pub fn gpl_version_predating_data_type(input_dir: &PathBuf) -> Option<String> {
+    let parent = std::path::Path::new(input_dir);
+    let meta_data_file = File::open(parent.join("generate_permit_list.json")).ok()?;
+    let mdata: serde_json::Value = serde_json::from_reader(BufReader::new(meta_data_file)).ok()?;
+    if mdata.get("data_type").is_some() {
+        return None;
+    }
+    Some(
+        mdata
+            .get("version_str")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(unknown version)")
+            .to_owned(),
+    )
 }
 
 pub fn is_velo_mode(input_dir: &PathBuf) -> bool {

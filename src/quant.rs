@@ -1863,21 +1863,55 @@ where
         }
     }
 
-    // The feature axis follows the data type generate-permit-list recorded, which
-    // identifies only Flex: Flex resolves per reference target, everything else per
-    // gene. The gene matrix is written either way; --probe-mtx adds the per-probe
-    // matrix it was summed from, and changes nothing that is computed.
+    // The feature axis follows the data type declared to generate-permit-list
+    // (--data-type flex) and recorded in generate_permit_list.json. It is never
+    // inferred: a multi-barcode layout also comes from transcriptome references,
+    // where resolving per target would make cr-like discard UMIs shared by a
+    // gene's isoforms.
+    // Flex resolves per reference target, everything else per gene. The gene
+    // matrix is written either way; --probe-mtx adds the per-probe matrix it was
+    // summed from, and changes nothing that is computed.
     let data_type = afutils::read_data_type(quant_opts.input_dir);
     let probe_level = data_type.as_deref() == Some(afutils::DATA_TYPE_FLEX);
-    if quant_opts.probe_mtx && !probe_level {
-        anyhow::bail!("--probe-mtx is only supported for Flex data.");
+    if !probe_level && (quant_opts.probe_mtx || sample_bc_extractor.is_some()) {
+        // Say why the run is quantified per gene where that may be unexpected: on
+        // a multi-barcode layout, which Flex has, and when --probe-mtx asks for a
+        // probe matrix. A directory written before the key existed (absent) is
+        // told apart from a run that did not declare --data-type flex (null).
+        let predates = afutils::gpl_version_predating_data_type(quant_opts.input_dir);
+        let why = match (&predates, &data_type) {
+            (Some(version), _) => {
+                format!("was written by alevin-fry {version}, which does not record a data_type")
+            }
+            (None, Some(other)) => format!("records data_type \"{other}\""),
+            (None, None) => {
+                "records no data_type (generate-permit-list was run without --data-type flex)"
+                    .to_string()
+            }
+        };
+        let fix = "If the reads were mapped to a 10x Flex probe set, re-run generate-permit-list with --data-type flex, then collate";
+        if quant_opts.probe_mtx {
+            anyhow::bail!(
+                "--probe-mtx is only supported for Flex data, which is quantified per probe, and generate_permit_list.json {why}. {fix}, to quantify per probe and write the probe matrix."
+            );
+        }
+        if sample_bc_extractor.is_some() {
+            let msg = format!(
+                "generate_permit_list.json {why}, so this multi-barcode data is quantified per gene. {fix}, to resolve UMIs per probe."
+            );
+            if predates.is_some() {
+                warn!(log, "{}", msg);
+            } else {
+                info!(log, "{}", msg);
+            }
+        }
     }
     let write_probe = probe_level && quant_opts.probe_mtx;
 
     if probe_level {
-        // Report the data type that was detected, and only that: the type is
-        // inferred rather than requested, so a run should not go on without
-        // saying so, and the line stays true however the handling changes.
+        // Report the declared data type, and only that: it switches the feature
+        // axis, so a run should not go on without saying so, and the line stays
+        // true however the handling changes.
         info!(
             log,
             "generate_permit_list.json records data_type \"{}\"",
@@ -1890,7 +1924,7 @@ where
         if dump_eq {
             warn!(
                 log,
-                "--dump-eqclasses on Flex data: UMIs are resolved per probe, so the ids in each equivalence class of gene_eqclass.txt.gz are probe (reference target) ids, not gene ids, and its first line is the number of probes."
+                "--dump-eqclasses on Flex data: UMIs are resolved per probe, so the ids in each equivalence class of gene_eqclass.txt.gz are probe (reference target) ids, not gene ids, and its first line is the number of probes. The ids index the probe names in probe_quants_mat_cols.txt."
             );
         }
         // The bootstrap reports the uncertainty in how the EM allocates a molecule
@@ -2059,8 +2093,9 @@ where
     } else {
         tid_to_gid_shared.clone()
     };
-    // Column names of the target matrix, in reference-id (RAD header) order.
-    let probe_names = write_probe.then(|| hdr.ref_names.clone());
+    // Column names of the target matrix, in reference-id (RAD header) order. They
+    // also name the probe ids of the equivalence classes, so -d writes them too.
+    let probe_names = (write_probe || (probe_level && dump_eq)).then(|| hdr.ref_names.clone());
     // the number of reference sequences
     let ref_count = hdr.ref_count as u32;
 
@@ -2495,7 +2530,8 @@ where
     // from the same counter, under the same lock that appends that cell's barcode --
     // so the row labels are written out a second time under the probe matrix's own
     // name rather than left implicit, which keeps each matrix loadable from its own
-    // triple of files.
+    // triple of files. With only -d, the names are written alone: they label the
+    // equivalence classes, and there is no probe matrix for rows to describe.
     if let Some(names) = &probe_names {
         let pn_path = output_matrix_path.join("probe_quants_mat_cols.txt");
         let pn_file = File::create(pn_path).context("could not create probe name output")?;
@@ -2504,12 +2540,14 @@ where
             writeln!(pn_writer, "{}", n)?;
         }
         pn_writer.flush().context("could not flush probe names")?;
-        // The barcode file is flushed and no longer written to by this point.
-        fs::copy(
-            output_matrix_path.join("quants_mat_rows.txt"),
-            output_matrix_path.join("probe_quants_mat_rows.txt"),
-        )
-        .context("could not write probe barcode output")?;
+        if write_probe {
+            // The barcode file is flushed and no longer written to by this point.
+            fs::copy(
+                output_matrix_path.join("quants_mat_rows.txt"),
+                output_matrix_path.join("probe_quants_mat_rows.txt"),
+            )
+            .context("could not write probe barcode output")?;
+        }
     }
 
     let pb_msg = format!(

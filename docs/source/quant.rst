@@ -37,7 +37,7 @@ Additionally, this command can optionally take the following flags (note that no
 
 * ``--use-mtx`` : This flag is accepted for backwards compatibility. Matrix market coordinate format is the default (and currently only) output format.
 
-* ``--probe-mtx`` : This flag will cause the probe-by-cell count matrix to be written to the output directory in addition to the gene-level count matrix, as ``probe_quants_mat.mtx`` with its own ``probe_quants_mat_cols.txt`` and ``probe_quants_mat_rows.txt``.  It changes only what is written and not what is computed; the gene-level matrix and ``featureDump.txt`` are the same with and without it.  This flag is only meaningful for Flex data, and passing it on any other data type is an error.
+* ``--probe-mtx`` : This flag will cause the probe-by-cell count matrix to be written to the output directory in addition to the gene-level count matrix, as ``probe_quants_mat.mtx`` with its own ``probe_quants_mat_cols.txt`` and ``probe_quants_mat_rows.txt``.  It changes only what is written and not what is computed; the gene-level matrix and ``featureDump.txt`` are the same with and without it.  This flag is only meaningful for Flex data, i.e. when ``generate-permit-list`` was run with ``--data-type flex``, and passing it on any other data is an error.
 
 There are also a few flags that are not immediately exposed:
 
@@ -48,9 +48,9 @@ There are also a few flags that are not immediately exposed:
 Flex data
 ---------
 
-For Flex data, ``quant`` resolves UMIs per probe rather than per gene.  The axis follows the ``data_type`` key recorded in ``generate_permit_list.json`` by ``generate-permit-list``.
+For Flex data, ``quant`` resolves UMIs per probe rather than per gene.  The axis follows the ``data_type`` key recorded in ``generate_permit_list.json`` by ``generate-permit-list``, which is ``"flex"`` only when ``generate-permit-list`` was run with ``--data-type flex`` (see :doc:`generate_permit_list`).  It is never inferred from the barcode layout: a multi-barcode RAD file mapped to a transcriptome (for example by ``simpleaf multiplex-quant`` with ``--t2g-map``) is quantified per gene, as is every other run without the declaration, including directories written by a ``generate-permit-list`` that predates the key.  For a multi-barcode run quantified per gene, ``quant`` logs which of these cases applies; to quantify such Flex data per probe, re-run ``generate-permit-list`` with ``--data-type flex`` and then ``collate``.
 
-Every reference target (probe) is its own feature, so UMI correction, deduplication, tie handling and the EM all act per probe, and the gene-level count matrix is then the sum of each gene's probes.  **Note**: the resulting gene counts are not identical to those a gene-level run produces, since correction and deduplication act per probe.  The per-cell statistics in ``featureDump.txt`` are computed from the probe-summed gene matrix.
+Every reference target (probe) is its own feature, so UMI correction, deduplication, tie handling and the EM all act per probe, and the gene-level count matrix is then the sum of each gene's probes.  **Note**: the resulting gene counts are not identical to those a gene-level run produces, since correction and deduplication act per probe.  In particular, under ``cr-like`` (and in the tiny-cell fast path, which applies its rules), a UMI whose reads tie between two probes is discarded even when both probes belong to the same gene, where a gene-level run counts it for that gene; the EM strategies apportion such a UMI among its probes, so it still counts for the gene.  Such ties are rare on real Flex data, since probes seldom multi-map.  The per-cell statistics in ``featureDump.txt`` are computed from the probe-summed gene matrix.
 
 The following are not available for Flex data:
 
@@ -58,7 +58,7 @@ The following are not available for Flex data:
 * A three-column (USA) transcript-to-gene map, since each UMI is resolved to a single probe and splicing status is not inferred.
 * ``--num-bootstraps``, which is ignored: Flex probes are designed to target a single gene with minimal cross-reactivity, so multi-mapping is rare enough that the replicates are not informative.  This is logged at run time.
 
-**Note**: with ``--dump-eqclasses``, the ids written to ``gene_eqclass.txt.gz`` are probe ids and its first line is the number of probes; this is logged at run time.
+**Note**: with ``--dump-eqclasses``, the ids written to ``gene_eqclass.txt.gz`` are probe ids and its first line is the number of probes; this is logged at run time.  The ids index the probe names written to ``probe_quants_mat_cols.txt``, one per line in reference (RAD header) order; that file is written with ``--dump-eqclasses`` even without ``--probe-mtx``.
 
 output
 ------
@@ -67,7 +67,7 @@ The output of the ``quant`` command consists of 5 files: ``quants_mat_rows.txt``
 
 If ``quant`` was executed in USA mode, then the resulting count matrix will be of dimension ``C``x``3G`` where ``C`` is the number of quantified cells (barcodes) and ``G`` is the number of genes.  This is because, in USA mode, ``alevin-fry`` quantifies the UMI count attributable to each splicing state of each gene in each cell, where the splicing state is one of spliced (S), unspliced (U) or ambiguous (A).  If ``quant`` was run with a two-column transcript-to-gene map (not in USA-mode), then the resulting count matrix will be a ``C``x``G`` matrix, as splicing status is not tracked.  For more details on USA mode and its uses, please read the ``alevin-fry`` `paper <https://www.nature.com/articles/s41592-022-01408-3>`__ or `preprint <https://www.biorxiv.org/content/10.1101/2021.06.29.450377v1>`__, or the `corresponding tutorial <https://combine-lab.github.io/alevin-fry-tutorials/2021/improving-txome-specificity/>`__.
 
-For Flex data run with ``--probe-mtx``, the output also contains ``probe_quants_mat.mtx``, ``probe_quants_mat_cols.txt`` and ``probe_quants_mat_rows.txt``.  This is the probe-by-cell matrix from which the gene-level matrix was summed.
+For Flex data run with ``--probe-mtx``, the output also contains ``probe_quants_mat.mtx``, ``probe_quants_mat_cols.txt`` and ``probe_quants_mat_rows.txt``.  This is the probe-by-cell matrix from which the gene-level matrix was summed.  For Flex data run with ``--dump-eqclasses`` but not ``--probe-mtx``, only ``probe_quants_mat_cols.txt`` is written, to name the probe ids in ``gene_eqclass.txt.gz``.
 
 The ``quants_mat.mtx`` is a matrix market `coordinate format <https://math.nist.gov/MatrixMarket/formats.html>`__ file that stores the gene-by-cell expression matrix. The two other files provide the labels for the rows and columns of this matrix. The ``quants_mat_cols.txt`` file is a text file that contains the names of the rows of the matrix, in the order in which it is written, with one gene name written per line. The ``quants_mat_rows.txt`` file is a text file that contains the names of the columns of the matrix, in the order in which it is written, with one barcode name written per line.
 
